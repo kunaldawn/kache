@@ -65,6 +65,8 @@ direction(const char *name)
 	return INFO;
 }
 
+static const Row *find(const Set *s, const char *name);
+
 static int
 load(Set *s, const char *path)
 {
@@ -86,6 +88,16 @@ load(Set *s, const char *path)
 		*sp = '\0';
 		if (s->n >= MAX_ROWS)
 			break;
+		/* A metric can only appear twice if two runs wrote the
+		 * same file, and then every value in it is suspect: the
+		 * comparison would silently take whichever came first. */
+		if (find(s, line)) {
+			fprintf(stderr, "kache-cmp: %s: %s appears more than "
+			    "once - this file is two runs interleaved, not "
+			    "one run\n", path, line);
+			fclose(f);
+			return -1;
+		}
 		snprintf(s->row[s->n].name, NAME_MAX, "%.*s", NAME_MAX - 1, line);
 		s->row[s->n].v = strtod(sp + 1, NULL);
 		s->n++;

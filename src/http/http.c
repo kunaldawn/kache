@@ -376,13 +376,7 @@ hdrs_end(Hdrs *h, size_t clen, int keepalive)
 void
 http_wrap(Buf *out, size_t mark, const Hdrs *h)
 {
-	size_t blen = out->len - mark;
-
-	buf_grow(out, h->n, 0);
-	if (blen)
-		memmove(out->p + mark + h->n, out->p + mark, blen);
-	memcpy(out->p + mark, h->b, h->n);
-	out->len += h->n;
+	buf_insert(out, mark, h->b, h->n);
 }
 
 void

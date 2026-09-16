@@ -64,7 +64,7 @@ benchmark: bench
 
 # record the current tree as the thing future runs are measured against
 baseline: bench
-	sh test/bench.sh -t baseline
+	sh test/bench.sh -t baseline -f
 
 check: kache
 	sh test/test.sh

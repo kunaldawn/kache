@@ -9,7 +9,7 @@ buf_free(Buf *b)
 {
 	free(b->p);
 	b->p = NULL;
-	b->len = b->cap = 0;
+	b->off = b->len = b->cap = 0;
 }
 
 int
@@ -40,22 +40,46 @@ buf_grow(Buf *b, size_t n, size_t max)
 void
 buf_drain(Buf *b, size_t n)
 {
-	if (n >= b->len) {
-		b->len = 0;
+	b->off += n;
+	if (b->off >= b->len)
+		b->off = b->len = 0;   /* the common case: nothing to move */
+}
+
+void
+buf_compact(Buf *b)
+{
+	if (!b->off)
 		return;
-	}
-	memmove(b->p, b->p + n, b->len - n);
-	b->len -= n;
+	if (b->len > b->off)
+		memmove(b->p, b->p + b->off, b->len - b->off);
+	b->len -= b->off;
+	b->off = 0;
 }
 
 void
 buf_trim(Buf *b, size_t keep)
 {
-	if (b->len == 0 && b->cap > keep) {
+	if (buf_used(b) == 0 && b->cap > keep) {
+		b->off = b->len = 0;
 		free(b->p);
 		b->p = NULL;
 		b->cap = 0;
 	}
+}
+
+/* Splice n bytes in at an absolute index, moving what follows up.  Used
+ * to put a header in front of a body that is already in the buffer, when
+ * its length was not known until it had been written. */
+void
+buf_insert(Buf *b, size_t at, const void *p, size_t n)
+{
+	size_t tail = b->len - at;
+
+	buf_grow(b, n, 0);
+	if (tail)
+		memmove(b->p + at + n, b->p + at, tail);
+	memcpy(b->p + at, p, n);
+	b->len += n;
 }
 
 void

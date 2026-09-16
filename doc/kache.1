@@ -139,6 +139,17 @@ Append the body.
 Prepend the body.
 .It Cm POST Ar /touch/<key>
 Reset the time to live.
+.It Cm POST Ar /mget
+One percent encoded key per line; the reply frames each value as its
+length, a newline and that many bytes, or
+.Ql -1
+for a miss.
+.It Cm POST Ar /mset
+Records of
+.Ql <key> <bytes> [ttl]
+followed by that many bytes.
+.It Cm POST Ar /mdel
+One key per line.
 .It Cm POST Ar /flush
 Drop everything.
 .It Cm GET Ar /stats
@@ -159,6 +170,10 @@ stores only when the key is absent and
 only when the value has not changed since it was read; both answer 412
 when the condition fails.  Every operation is atomic with respect to
 every other operation on the same key.
+.Pp
+The batch endpoints exist because a round trip costs far more than a
+lookup does.  They are not atomic across keys: each key is taken under
+its own shard lock in turn.
 .Sh FILES
 .Bl -tag -width Ds
 .It Pa config.def.h

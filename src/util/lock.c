@@ -2,9 +2,21 @@
  * The fast paths are inlined in lock.h. */
 #include <errno.h>
 #include <limits.h>
-#include <linux/futex.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+/* The futex operations are kernel ABI and settled; spelling them out
+ * here instead of including <linux/futex.h> means the build needs no
+ * kernel headers installed, which minimal toolchains do not ship. */
+#ifndef FUTEX_WAIT
+#define FUTEX_WAIT 0
+#endif
+#ifndef FUTEX_WAKE
+#define FUTEX_WAKE 1
+#endif
+#ifndef FUTEX_PRIVATE_FLAG
+#define FUTEX_PRIVATE_FLAG 128
+#endif
 
 #include "config.h"
 #include "util/lock.h"

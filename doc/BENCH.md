@@ -116,6 +116,17 @@ is needed to diff two runs, and nothing about it needs a parser:
 Results live in `bench/` and are not committed: they only mean something
 on the machine that produced them.
 
+A run refuses to overwrite an existing result file unless given `-f`, and
+refuses to start at all while another run holds the lock in `bench/`,
+because two runs appending to one file interleave their metrics into
+something no comparison can read.  `kache-cmp` rejects such a file rather
+than silently taking whichever value came first, but not starting the
+second run is better than diagnosing it afterwards.
+
+A run that is killed outright never reaches its cleanup, so it can leave
+a server and a store behind.  The next run notices the stale lock, kills
+that server and removes that store before taking over.
+
 The metric naming rule
 ----------------------
 
@@ -179,6 +190,14 @@ Each tool is usable on its own; `test/bench.sh` only sequences them.
     ./kache-bench -W mixed -L -d 5          # latency instead
 
     ./kache-cmp -a bench/baseline.txt bench/mine.txt
+
+Comparing against something else
+--------------------------------
+
+`doc/COMPARISON.md` is a worked example of all of the above pointed at
+Redis rather than at an earlier kache: two servers in containers, matched
+client parameters, interleaved measurements, medians, and a section on
+the two measurements that came out backwards before the method was fixed.
 
 Finding something other than a regression
 -----------------------------------------

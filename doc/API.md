@@ -82,6 +82,75 @@ result would exceed the value limit.  The TTL and flags are preserved.
 Applies a new TTL without touching the value.  `204`, or `404`.
 `?ttl=0` makes the entry permanent.
 
+Batch endpoints
+---------------
+
+One request, many keys.  A single `GET` spends about 230 ns in the store
+and 27 microseconds getting there and back, so for a caller that needs
+fifty keys the round trip is the whole cost.  Pipelining removes it too,
+but almost no HTTP client library will pipeline, whereas any of them can
+post a list.  Measured on loopback, against single `GET`s from the same
+non-pipelining client: 5.1x at 8 keys a batch, 21x at 64, 33x at 256.
+
+**A batch is not a snapshot.**  Each key is taken under its own shard
+lock in turn, so a batch is N independent operations that happened to
+share a request, and another client's write can land in the middle of
+one.  Redis can promise otherwise because it runs commands on a single
+thread.  Callers that already cope with a write landing between two
+separate `GET`s need no changes; callers that need a real snapshot do not
+want a cache.
+
+A batch may carry up to 1024 keys (`CFG_BATCH_MAX`), and the body is
+bounded like any other at `CFG_MAX_VAL + CFG_REQ_SLACK`.
+
+### `POST /mget`
+
+Body: one percent encoded key per line, exactly as they are written in a
+path.  Blank lines are ignored.
+
+Response: one frame per key, in order.  A hit is the value's length in
+decimal, a newline, that many raw bytes, and a newline.  A miss is `-1`
+and a newline.  Length prefixing is what keeps values binary safe.
+
+    POST /mget                    200 OK
+    alpha                         X-Kache-Count: 3
+    beta                          X-Kache-Hits: 2
+    missing
+                                  5
+                                  hello
+                                  3
+                                  abc
+                                  -1
+
+Per key metadata is deliberately absent: use `GET /kv/<key>` when you
+need the `ETag` or the remaining TTL.
+
+### `POST /mset`
+
+Body: one record per line pair.  A header line of `<key> <bytes>` with an
+optional third field giving that record's TTL in seconds, then exactly
+that many raw bytes, then a newline.  The key is percent encoded; the
+value is length prefixed and may contain anything.
+
+    POST /mset?ttl=60
+    alpha 5
+    hello
+    beta 3 300
+    abc
+
+`204` when every record was stored, with `X-Kache-Count` and
+`X-Kache-Stored`.  `507` with the same headers when the arena refused
+some of them, so a partial write is always visible rather than silent.
+
+The whole body is parsed before anything is written, so a malformed
+batch is rejected with `400` and changes nothing.  A batch cannot be
+applied atomically, but it can be rejected atomically.
+
+### `POST /mdel`
+
+Body: one percent encoded key per line, as for `/mget`.  `204` with
+`X-Kache-Count` and `X-Kache-Deleted`.
+
 ### `POST /flush`, `DELETE /flush`
 
 Empties the store.  `204`.  Disabled unless the server was started with

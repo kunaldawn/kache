@@ -457,6 +457,9 @@ static const char index_page[] =
 "  POST   /append/<key>        append the body\n"
 "  POST   /prepend/<key>       prepend the body\n"
 "  POST   /touch/<key>         reset the ttl\n"
+"  POST   /mget                one key per line, framed values back\n"
+"  POST   /mset                \"<key> <bytes> [ttl]\" then the bytes\n"
+"  POST   /mdel                one key per line\n"
 "  POST   /flush               drop everything\n"
 "  GET    /stats               counters, one per line\n"
 "  GET    /metrics             the same in prometheus form\n"
@@ -469,6 +472,9 @@ static const char index_page[] =
 "  If-Match: \"<etag>\"          store or delete only on that version\n";
 
 /* ---- dispatch -------------------------------------------------------- */
+
+static void do_mget(Ctx *c, const Req *r, Buf *out, int ka, int del);
+static void do_mset(Ctx *c, const Req *r, Buf *out, int ka);
 
 static int
 key_or_fail(Ctx *c, Buf *out, int ka, Str rest, Key *k)
@@ -535,6 +541,18 @@ route(Ctx *c, const Req *r, Buf *out, int *keepalive)
 			do_touch(c, r, out, ka, &k);
 			return;
 		}
+		if (r->path.n == 5 && !memcmp(r->path.p, "/mget", 5)) {
+			do_mget(c, r, out, ka, 0);
+			return;
+		}
+		if (r->path.n == 5 && !memcmp(r->path.p, "/mdel", 5)) {
+			do_mget(c, r, out, ka, 1);
+			return;
+		}
+		if (r->path.n == 5 && !memcmp(r->path.p, "/mset", 5)) {
+			do_mset(c, r, out, ka);
+			return;
+		}
 	}
 	if (r->path.n == 6 && !memcmp(r->path.p, "/flush", 6)) {
 		if (r->meth != M_POST && r->meth != M_DELETE) {
@@ -569,4 +587,265 @@ route(Ctx *c, const Req *r, Buf *out, int *keepalive)
 		}
 	}
 	fail(c, out, 404, ka, "no such endpoint");
+}
+
+/* ---- batch operations -------------------------------------------------
+ *
+ * One request, many keys.  A single GET spends roughly 230ns in the
+ * store and 27us getting there and back, so for a caller that needs
+ * fifty keys the round trip is the entire cost and the only thing worth
+ * removing.  Pipelining removes it too, but almost no HTTP client will
+ * pipeline, whereas any of them can post a list.
+ *
+ * A batch is emphatically not a snapshot.  The keys land in different
+ * shards and each is taken under its own lock in turn, so the result is
+ * N independent operations that happened to share a request, and another
+ * client's write can land in the middle of one.  Redis can promise
+ * otherwise because it runs commands on a single thread; buying the same
+ * promise here would mean holding several shard locks at once, in a
+ * fixed order, for the length of the batch - which would cost far more
+ * than it is worth to a cache whose callers already cope with a write
+ * landing between two separate GETs. */
+
+/* Splits the body on newlines; a trailing \r is tolerated. */
+static int
+batch_line(const char **pp, const char *end, Str *line)
+{
+	const char *p = *pp, *nl;
+
+	if (p >= end)
+		return 0;
+	nl = memchr(p, '\n', (size_t)(end - p));
+	line->p = p;
+	line->n = nl ? (size_t)(nl - p) : (size_t)(end - p);
+	if (line->n && line->p[line->n - 1] == '\r')
+		line->n--;
+	*pp = nl ? nl + 1 : end;
+	return 1;
+}
+
+static int
+batch_field(Str *rest, Str *field)
+{
+	const char *sp;
+
+	while (rest->n && *rest->p == ' ') {
+		rest->p++;
+		rest->n--;
+	}
+	if (!rest->n)
+		return 0;
+	sp = memchr(rest->p, ' ', rest->n);
+	field->p = rest->p;
+	field->n = sp ? (size_t)(sp - rest->p) : rest->n;
+	rest->p += field->n;
+	rest->n -= field->n;
+	return 1;
+}
+
+static void
+do_mget(Ctx *c, const Req *r, Buf *out, int ka, int del)
+{
+	size_t mark = out->len;
+	const char *p = r->body.p, *end = r->body.p + r->body.n;
+	Hdrs h;
+	Str line;
+	Key k;
+	u32 n = 0, found = 0;
+
+	while (batch_line(&p, end, &line)) {
+		DbMeta m;
+		char pre[24];
+		size_t vmark;
+		int rc = DB_ENOENT, tries;
+
+		if (!line.n)
+			continue;                  /* blank lines are ignored */
+		if (++n > CFG_BATCH_MAX) {
+			out->len = mark;
+			fail(c, out, 413, ka, "too many keys in one batch");
+			return;
+		}
+		if (take_key(line, &k) < 0) {
+			out->len = mark;
+			fail(c, out, 400, ka, "bad key in batch");
+			return;
+		}
+		if (del) {
+			if (db_del(c->db, k.c, k.n, 0, 0) == DB_OK)
+				found++;
+			continue;
+		}
+		vmark = out->len;
+		for (tries = 0; tries < 4; tries++) {
+			u32 cap;
+
+			if (buf_room(out) < 512)
+				buf_grow(out, 512, 0);
+			cap = (u32)MIN(buf_room(out), (size_t)0xffffffffu);
+			rc = db_get(c->db, k.c, k.n, buf_tail(out), cap, &m);
+			if (rc != DB_ESMALL)
+				break;
+			buf_grow(out, m.vlen, 0);
+		}
+		if (rc == DB_OK) {
+			/* the length is only known once the value is in
+			 * place, so the frame header goes in afterwards */
+			size_t pn = fmt_u64(pre, m.vlen);
+
+			pre[pn++] = '\n';
+			out->len += m.vlen;
+			buf_insert(out, vmark, pre, pn);
+			buf_putc(out, '\n');
+			found++;
+		} else {
+			buf_puts(out, "-1\n");
+		}
+	}
+
+	if (del) {
+		st_add(&c->st->dels, found);
+		hdrs_start(&h, 204, clk_date());
+		hdrs_num(&h, "X-Kache-Count", (i64)n);
+		hdrs_num(&h, "X-Kache-Deleted", (i64)found);
+		hdrs_end(&h, 0, ka);
+		buf_put(out, h.b, h.n);
+		return;
+	}
+	st_add(&c->st->hits, found);
+	st_add(&c->st->misses, n - found);
+	hdrs_start(&h, 200, clk_date());
+	hdrs_lit(&h, "Content-Type", CT_BIN);
+	hdrs_num(&h, "X-Kache-Count", (i64)n);
+	hdrs_num(&h, "X-Kache-Hits", (i64)found);
+	hdrs_end(&h, out->len - mark, ka);
+	http_wrap(out, mark, &h);
+}
+
+typedef struct MRec {
+	Key         k;
+	const char *v;
+	u32         vlen;
+	i64         ttl;
+} MRec;
+
+/* One record: "<key> <bytes> [<ttl>]\n" then exactly that many raw bytes
+ * and an optional newline.  The key is percent encoded as it is in a
+ * path, the value is length prefixed and so may contain anything.
+ * Returns 1 for a record, 0 at the end of the body, -1 on malformed. */
+static int
+batch_record(const char **pp, const char *end, i64 dflt, MRec *rec,
+             const char **why)
+{
+	Str line, rest, f;
+	const char *p;
+	u64 vlen;
+
+	do {
+		if (!batch_line(pp, end, &line))
+			return 0;
+	} while (!line.n);
+
+	rest = line;
+	if (!batch_field(&rest, &f)) {
+		*why = "missing key";
+		return -1;
+	}
+	if (take_key(f, &rec->k) < 0) {
+		*why = "bad key";
+		return -1;
+	}
+	if (!batch_field(&rest, &f)) {
+		*why = "missing value length";
+		return -1;
+	}
+	if (parse_u64(f.p, f.n, &vlen) < 0 || vlen > 0xffffffffull) {
+		*why = "bad value length";
+		return -1;
+	}
+	rec->ttl = dflt;
+	if (batch_field(&rest, &f)) {
+		i64 t;
+
+		if (parse_i64(f.p, f.n, &t) < 0 || t < 0 || t > INT64_MAX / 1000) {
+			*why = "bad ttl";
+			return -1;
+		}
+		rec->ttl = t ? t * 1000 : DB_FOREVER;
+	}
+	p = *pp;
+	if ((u64)(end - p) < vlen) {
+		*why = "value shorter than its declared length";
+		return -1;
+	}
+	rec->v = p;
+	rec->vlen = (u32)vlen;
+	p += vlen;
+	if (p < end && *p == '\r')
+		p++;
+	if (p < end && *p == '\n')
+		p++;
+	*pp = p;
+	return 1;
+}
+
+static void
+do_mset(Ctx *c, const Req *r, Buf *out, int ka)
+{
+	const char *p, *end = r->body.p + r->body.n;
+	const char *why = "malformed batch";
+	MRec rec;
+	Hdrs h;
+	i64 ttl;
+	u32 flags, n = 0, stored = 0;
+	int rc, toomany = 0;
+
+	if (take_ttl(r, c->default_ttl, &ttl) < 0) {
+		fail(c, out, 400, ka, "bad ttl");
+		return;
+	}
+	if (take_flags(r, &flags) < 0) {
+		fail(c, out, 400, ka, "bad flags");
+		return;
+	}
+
+	/* Pass one parses the whole body without touching the store.  A
+	 * batch cannot be applied atomically, but it can at least be
+	 * rejected atomically, so a malformed one changes nothing. */
+	p = r->body.p;
+	while ((rc = batch_record(&p, end, ttl, &rec, &why)) == 1) {
+		if (++n > CFG_BATCH_MAX) {
+			why = "too many records in one batch";
+			toomany = 1;
+			rc = -1;
+			break;
+		}
+		if (rec.vlen > c->db->map.maxval) {
+			why = "value too large";
+			rc = -1;
+			break;
+		}
+	}
+	if (rc < 0) {
+		fail(c, out, toomany ? 413 : 400, ka, why);
+		return;
+	}
+
+	p = r->body.p;
+	while (batch_record(&p, end, ttl, &rec, &why) == 1) {
+		if (db_set(c->db, rec.k.c, rec.k.n, rec.v, rec.vlen, rec.ttl,
+		           flags, SET_ANY, 0, NULL) == DB_OK)
+			stored++;
+	}
+	st_add(&c->st->sets, stored);
+	if (stored != n)
+		st_inc(&c->st->errors);
+
+	/* Everything parsed, so the only way a record can fail now is the
+	 * arena refusing to make room; say which ones landed. */
+	hdrs_start(&h, stored == n ? 204 : 507, clk_date());
+	hdrs_num(&h, "X-Kache-Count", (i64)n);
+	hdrs_num(&h, "X-Kache-Stored", (i64)stored);
+	hdrs_end(&h, 0, ka);
+	buf_put(out, h.b, h.n);
 }

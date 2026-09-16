@@ -193,6 +193,45 @@ buffer and the finished headers are then inserted in front, which costs
 one `memmove` of the body and keeps the exact `Content-Length` without
 either a second lookup or a padded header.
 
+Both buffers carry a read cursor rather than sliding their contents down
+as they are consumed.  That matters most on the input side: a pipelined
+batch used to `memmove` the remainder once per request, so draining N
+buffered requests was quadratic in N and in their size.  With a cursor the
+bytes move at most once per read syscall.  Compaction is therefore
+explicit and deliberately absent from `buf_grow`, because response
+building holds absolute indexes into the buffer while a body is assembled
+and shifting the contents underneath it would invalidate them - growing
+may realloc, which preserves them; compacting would not.
+
+Batch operations
+----------------
+
+`/mget`, `/mset` and `/mdel` exist for one reason: a `GET` costs about
+230 ns in the store and 27 microseconds getting there and back.  For a
+caller that needs fifty keys, the round trip is the entire cost, and it is
+the only thing worth removing.  HTTP pipelining removes it too, and kache
+supports it, but in practice no HTTP client library pipelines - whereas
+every one of them can post a list.
+
+The keys in a batch land in different shards and each is taken under its
+own lock in turn, so a batch is N independent operations that share a
+request rather than a snapshot.  Redis can promise otherwise because it
+executes commands on one thread; buying the same promise here would mean
+holding several shard locks at once in a fixed order for the length of the
+batch, which would serialise exactly the work the sharding exists to
+spread.  A cache's callers already cope with a write landing between two
+separate `GET`s, so the trade is not a close one.
+
+`/mset` does parse the whole body before writing anything, so a malformed
+batch is rejected without changing the store.  A batch cannot be applied
+atomically, but it can be rejected atomically, and that is worth the
+second pass over a body that is already in memory.
+
+The framing is length prefixed rather than delimited, which is what keeps
+values binary safe, and the length of a value is only known once it has
+been fetched - so each frame's header is spliced in front of the value
+after the fact, the same `buf_insert` the response headers use.
+
 Counters are per worker, one cache line each, written only by their owner.
 They are relaxed atomics rather than plain integers: a plain read in
 `/stats` next to a plain write in a worker is a data race even though no

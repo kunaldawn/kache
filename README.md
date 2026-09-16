@@ -42,7 +42,8 @@ Layout
     test/bench.c     HTTP load generator
     test/cmp.c       diffs two benchmark runs
     test/bench.sh    runs the suite and writes one result file
-    doc/             design notes, HTTP reference, benchmarking, man page
+    doc/             design notes, HTTP reference, benchmarking,
+                     a measured comparison against Redis, man page
 
 Each layer only ever includes downwards: `http/` knows about `store/`,
 `store/` knows about `util/`, and nothing knows about `http/`.
@@ -115,6 +116,9 @@ HTTP interface
     POST   /append/<key>   append the body
     POST   /prepend/<key>  prepend the body
     POST   /touch/<key>    reset the ttl
+    POST   /mget           many keys, one round trip
+    POST   /mset           many values, one round trip
+    POST   /mdel           many deletes, one round trip
     POST   /flush          drop everything (needs -F)
     GET    /stats          counters, one per line
     GET    /metrics        the same, in prometheus form
@@ -187,11 +191,23 @@ widens its threshold by exactly that spread before calling anything a
 regression.  `doc/BENCH.md` has the rest, including how to get numbers
 worth trusting.
 
-On a loopback benchmark - 4 worker threads, 8 client threads, 16 deep
-pipelining, 64 byte values, 90% reads - this machine served about 2.8M
-operations per second, with an unpipelined p50 under 30 microseconds.
-Expect that to be bounded by your network long before it is bounded by
-the store.
+On a loopback benchmark - 8 client threads, 64 byte values - this machine
+served about 2.8M operations per second at 16 deep pipelining, with an
+unpipelined p50 under 30 microseconds.  Expect that to be bounded by your
+network long before it is bounded by the store.
+
+The number that matters more, because it is the one an ordinary client
+can reach without pipelining:
+
+    single GET, one in flight       284,601 ops/s
+    POST /mget,   8 keys          1,458,185 ops/s     5.1x
+    POST /mget,  32 keys          3,909,275 ops/s    13.7x
+    POST /mget,  64 keys          5,985,996 ops/s    21.0x
+    POST /mget, 256 keys          9,414,891 ops/s    33.1x
+
+A `GET` costs about 230 ns in the store and 27 microseconds getting there
+and back, so for anything that needs more than one key the round trip is
+the whole cost.
 
 Limits worth knowing
 --------------------

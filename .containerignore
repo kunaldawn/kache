@@ -1,0 +1,9 @@
+bench/
+*.o
+/kache
+/kache-bench
+/kache-micro
+/kache-cmp
+config.h
+*.db
+.git/

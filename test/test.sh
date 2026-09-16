@@ -117,6 +117,37 @@ sleep 0.5
 check "expired"           404 "$URL/kv/t"
 check "bad ttl"           400 -X PUT -d t "$URL/kv/t?ttl=abc"
 
+echo "batch operations"
+printf 'ba 2\nAA\nbb 2\nBB\n' > "$DIR/mset"
+printf 'ba\nbb\nabsent\n' > "$DIR/mkeys"
+check "mset"              204 -X POST --data-binary "@$DIR/mset" "$URL/mset"
+body  "mset stored first" AA "$URL/kv/ba"
+body  "mset stored last"  BB "$URL/kv/bb"
+got=$(curl -sS -m 10 -X POST --data-binary "@$DIR/mkeys" "$URL/mget" | tr '\n' '|')
+if [ "$got" = "2|AA|2|BB|-1|" ]; then
+	ok "mget frames"
+else
+	bad "mget frames" "got '$got'"
+fi
+hdr -X POST --data-binary "@$DIR/mkeys" "$URL/mget" | grep -q '^X-Kache-Hits: 2$' \
+	&& ok "mget hit count" || bad "mget hit count" "header missing"
+check "mget empty body"   200 -X POST --data-binary '' "$URL/mget"
+check "mset bad length"   400 -X POST --data-binary 'zz notanumber' "$URL/mset"
+check "mset truncated"    400 -X POST --data-binary 'zz 99
+short' "$URL/mset"
+check "nothing written"   404 "$URL/kv/zz"
+check "mdel"              204 -X POST --data-binary "@$DIR/mkeys" "$URL/mdel"
+check "mdel removed"      404 "$URL/kv/ba"
+check "mget on GET"       404 "$URL/mget"
+# length prefixing is the whole reason the frames are not delimited
+printf 'one\ntwo\n' > "$DIR/binary"
+curl -sS -m 10 -X PUT --data-binary "@$DIR/binary" "$URL/kv/nl" -o /dev/null
+got=$(curl -sS -m 10 -X POST --data-binary 'nl' "$URL/mget" | od -An -c | tr -s ' ')
+case "$got" in
+*'8 \n o n e \n t w o \n \n'*) ok "mget binary safe" ;;
+*) bad "mget binary safe" "got '$got'" ;;
+esac
+
 echo "limits and errors"
 long=$(printf 'k%.0s' $(seq 1 600))
 check "key too long"      414 -X PUT -d x "$URL/kv/$long"

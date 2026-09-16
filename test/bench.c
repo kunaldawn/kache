@@ -29,9 +29,11 @@
  * for everything a local cache does and costs 256 KiB a thread. */
 #define HBUCKETS 65536
 
-enum { W_GET, W_SET, W_MIXED, W_INCR, W_FILL };
+enum { W_GET, W_SET, W_MIXED, W_INCR, W_MGET, W_FILL };
 
-static const char *const wnames[] = { "get", "set", "mixed", "incr", "fill" };
+static const char *const wnames[] = {
+	"get", "set", "mixed", "incr", "mget", "fill"
+};
 
 static const char *host = "127.0.0.1";
 static const char *port = "7070";
@@ -42,6 +44,7 @@ static int keyspace = 100000;
 static int valsize = 64;
 static int readpct = 90;
 static int workload = W_MIXED;
+static int batch = 64;         /* keys per request in the mget workload */
 static int latency;
 static int reps = 3;
 static int warmup = 1;
@@ -58,6 +61,7 @@ typedef struct Thread {
 	size_t reqcap;
 	char *buf;          /* response buffer */
 	size_t buflen, bufcap;
+	size_t off;         /* read cursor into buf */
 	size_t need;        /* body bytes still to skip */
 	u64   ops;
 	u64   errs;
@@ -65,6 +69,7 @@ typedef struct Thread {
 	u64   over;
 	u64   max_us;
 	char *val;
+	char *scratch;      /* batch body, assembled before its header */
 } Thread;
 
 /* ---- plumbing --------------------------------------------------------- */
@@ -122,11 +127,37 @@ hist_add(Thread *t, double sec)
 
 /* ---- request and response --------------------------------------------- */
 
+/* A batch request has to know its own body length before it can write
+ * the Content-Length, so the body is assembled first and the header goes
+ * in front of it afterwards. */
+static size_t
+build_mget(Thread *t, u64 *s, size_t at)
+{
+	size_t body = 0, hdr;
+	int i;
+
+	for (i = 0; i < batch; i++)
+		body += (size_t)snprintf(t->scratch + body,
+		    (size_t)batch * 16 - body, "k%u\n",
+		    (unsigned)(xrand(s) % (unsigned)keyspace));
+	hdr = (size_t)snprintf(t->req + at, t->reqcap - at,
+	    "POST /mget HTTP/1.1\r\nHost: b\r\nContent-Length: %zu\r\n\r\n",
+	    body);
+	memcpy(t->req + at + hdr, t->scratch, body);
+	return hdr + body;
+}
+
 static size_t
 build(Thread *t, u64 *s, int n)
 {
 	size_t len = 0;
 	int i;
+
+	if (workload == W_MGET) {
+		for (i = 0; i < n; i++)
+			len += build_mget(t, s, len);
+		return len;
+	}
 
 	for (i = 0; i < n; i++) {
 		u64 r = xrand(s);
@@ -157,38 +188,39 @@ build(Thread *t, u64 *s, int n)
 
 /* Pulls whole responses out of the buffer and returns how many.  Only
  * the status class and the content length are looked at; this is a load
- * generator, not a conformance checker. */
+ * generator, not a conformance checker.
+ *
+ * Like the server, it consumes with a cursor and scans only the bytes it
+ * has not consumed.  Doing either of those per response over the whole
+ * buffer makes the client quadratic in the pipeline depth, and a load
+ * generator that becomes the bottleneck measures itself. */
 static int
 consume(Thread *t)
 {
 	int done = 0;
 
 	for (;;) {
-		char *end, *cl;
-		size_t hdr;
+		char *at = t->buf + t->off, *end, *cl;
+		size_t avail = t->buflen - t->off, hdr;
 		long body = 0;
 
 		if (t->need) {
-			size_t take = t->need < t->buflen ? t->need : t->buflen;
+			size_t take = t->need < avail ? t->need : avail;
 
-			memmove(t->buf, t->buf + take, t->buflen - take);
-			t->buflen -= take;
+			t->off += take;
 			t->need -= take;
 			if (t->need)
 				return done;
 			continue;
 		}
-		t->buf[t->buflen] = '\0';
-		if (!(end = strstr(t->buf, "\r\n\r\n")))
+		if (!(end = memmem(at, avail, "\r\n\r\n", 4)))
 			return done;
-		hdr = (size_t)(end - t->buf) + 4;
-		if (t->buflen > 9 && t->buf[9] != '2')
+		hdr = (size_t)(end - at) + 4;
+		if (avail > 9 && at[9] != '2')
 			t->errs++;
-		if ((cl = strstr(t->buf, "\r\nContent-Length:")) != NULL &&
-		    cl < end)
+		if ((cl = memmem(at, hdr, "\r\nContent-Length:", 17)) != NULL)
 			body = strtol(cl + 17, NULL, 10);
-		memmove(t->buf, t->buf + hdr, t->buflen - hdr);
-		t->buflen -= hdr;
+		t->off += hdr;
 		t->need = (size_t)body;
 		done++;
 	}
@@ -200,9 +232,19 @@ await(Thread *t, int want)
 	int got = 0;
 
 	while (got < want) {
-		ssize_t n = read(t->fd, t->buf + t->buflen,
-		                 t->bufcap - 1 - t->buflen);
+		ssize_t n;
 
+		/* reclaim consumed bytes once per read, not once per
+		 * response */
+		if (t->off) {
+			if (t->buflen > t->off)
+				memmove(t->buf, t->buf + t->off,
+				        t->buflen - t->off);
+			t->buflen -= t->off;
+			t->off = 0;
+		}
+		n = read(t->fd, t->buf + t->buflen,
+		         t->bufcap - 1 - t->buflen);
 		if (n <= 0)
 			return -1;
 		t->buflen += (size_t)n;
@@ -261,7 +303,7 @@ worker(void *arg)
 			break;
 		if (latency)
 			hist_add(t, now_s() - t0);
-		t->ops += (u64)pipeline;
+		t->ops += (u64)pipeline * (workload == W_MGET ? (u64)batch : 1);
 	}
 	close(t->fd);
 	return NULL;
@@ -310,7 +352,8 @@ usage(int code)
 	    "  -k keys     keyspace                       (default 100000)\n"
 	    "  -v bytes    value size                     (default 64)\n"
 	    "  -R pct      reads in the mixed workload    (default 90)\n"
-	    "  -S seed     key selection seed             (default 1)\n");
+	    "  -S seed     key selection seed             (default 1)\n"
+	    "  -B keys     keys per request, mget only    (default 64)\n");
 	exit(code);
 }
 
@@ -330,7 +373,7 @@ main(int argc, char *argv[])
 	u64 cur_n = 0;
 	int opt, r, i;
 
-	while ((opt = getopt(argc, argv, "mLn:h:p:W:t:P:d:r:w:k:v:R:S:?")) != -1) {
+	while ((opt = getopt(argc, argv, "mLn:h:p:W:t:P:d:r:w:k:v:R:S:B:?")) != -1) {
 		switch (opt) {
 		case 'm': metric_machine = 1; break;
 		case 'L': latency = 1; break;
@@ -346,6 +389,7 @@ main(int argc, char *argv[])
 		case 'v': valsize = atoi(optarg); break;
 		case 'R': readpct = atoi(optarg); break;
 		case 'S': seed0 = strtoull(optarg, NULL, 10); break;
+		case 'B': batch = atoi(optarg); break;
 		case 'W':
 			for (i = 0; i < (int)(sizeof(wnames) / sizeof(*wnames));
 			     i++) {
@@ -361,7 +405,8 @@ main(int argc, char *argv[])
 		}
 	}
 	if (nthreads < 1 || pipeline < 1 || keyspace < 1 || valsize < 1 ||
-	    valsize > (1 << 20) || reps < 1 || reps > REPS_MAX)
+	    valsize > (1 << 20) || reps < 1 || reps > REPS_MAX ||
+	    batch < 1 || batch > 4096)
 		usage(2);
 	if (latency)
 		pipeline = 1;
@@ -374,10 +419,20 @@ main(int argc, char *argv[])
 	t = calloc((size_t)nthreads, sizeof(*t));
 	for (i = 0; i < nthreads; i++) {
 		t[i].id = i;
-		t[i].reqcap = (size_t)pipeline * ((size_t)valsize + 192) + 256;
-		t[i].bufcap = (size_t)pipeline * ((size_t)valsize + 512) + 8192;
+		if (workload == W_MGET) {
+			t[i].reqcap = (size_t)pipeline *
+			    ((size_t)batch * 16 + 128) + 256;
+			t[i].bufcap = (size_t)pipeline * (size_t)batch *
+			    ((size_t)valsize + 16) + 8192;
+		} else {
+			t[i].reqcap = (size_t)pipeline *
+			    ((size_t)valsize + 192) + 256;
+			t[i].bufcap = (size_t)pipeline *
+			    ((size_t)valsize + 512) + 8192;
+		}
 		t[i].req = malloc(t[i].reqcap);
 		t[i].buf = malloc(t[i].bufcap);
+		t[i].scratch = malloc((size_t)batch * 16 + 64);
 		t[i].val = malloc((size_t)valsize + 1);
 		t[i].hist = calloc(HBUCKETS, sizeof(*t[i].hist));
 		memset(t[i].val, 'v', (size_t)valsize);
@@ -393,7 +448,7 @@ main(int argc, char *argv[])
 		atomic_store(&stop, 0);
 		for (i = 0; i < nthreads; i++) {
 			t[i].ops = t[i].errs = 0;
-			t[i].buflen = t[i].need = 0;
+			t[i].buflen = t[i].off = t[i].need = 0;
 			pthread_create(&t[i].th, NULL, worker, &t[i]);
 		}
 		t0 = now_s();
@@ -478,6 +533,10 @@ main(int argc, char *argv[])
 			if (workload == W_FILL)
 				snprintf(extra, sizeof(extra),
 				         "fill, %d conn", nthreads);
+			else if (workload == W_MGET)
+				snprintf(extra, sizeof(extra),
+				         "mget, %d conn x %d deep x %d keys",
+				         nthreads, pipeline, batch);
 			else
 				snprintf(extra, sizeof(extra),
 				         "%s, %d conn x %d deep",

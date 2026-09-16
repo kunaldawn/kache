@@ -115,8 +115,8 @@ conn_open(Pool *p, int fd, int epfd, u64 now)
 	c->fd = fd;
 	c->epfd = epfd;
 	c->events = 0;
-	c->in.len = c->out.len = 0;
-	c->sent = 0;
+	c->in.off = c->in.len = 0;
+	c->out.off = c->out.len = 0;
 	c->open = 1;
 	c->closing = 0;
 	c->continued = 0;
@@ -144,7 +144,6 @@ conn_close(Pool *p, Conn *c, Stats *st)
 	list_unlink(p, c);
 	buf_free(&c->in);
 	buf_free(&c->out);
-	c->sent = 0;
 	c->fnext = p->freelist;
 	p->freelist = c;
 	p->used--;
@@ -171,11 +170,12 @@ process(Conn *c, Ctx *ctx)
 		size_t total;
 		int n, ka;
 
-		if (c->closing || !c->in.len)
+		if (c->closing || !buf_used(&c->in))
 			return;
-		n = http_head((const char *)c->in.p, c->in.len, &r);
+		n = http_head((const char *)buf_data(&c->in),
+		              buf_used(&c->in), &r);
 		if (n == 0) {
-			if (c->in.len >= ctx->max_req)
+			if (buf_used(&c->in) >= ctx->max_req)
 				bail(c, 431);
 			return;
 		}
@@ -190,7 +190,7 @@ process(Conn *c, Ctx *ctx)
 			bail(c, 413);
 			return;
 		}
-		if (c->in.len < total) {
+		if (buf_used(&c->in) < total) {
 			if (r.expect100 && !c->continued) {
 				buf_puts(&c->out,
 				    "HTTP/1.1 100 Continue\r\n\r\n");
@@ -198,7 +198,7 @@ process(Conn *c, Ctx *ctx)
 			}
 			return;
 		}
-		r.body.p = (const char *)c->in.p + n;
+		r.body.p = (const char *)buf_data(&c->in) + n;
 		r.body.n = r.clen;
 		c->continued = 0;
 
@@ -208,7 +208,7 @@ process(Conn *c, Ctx *ctx)
 			c->closing = 1;
 			return;
 		}
-		if (c->out.len - c->sent >= CFG_OUT_HIGH)
+		if (buf_used(&c->out) >= CFG_OUT_HIGH)
 			return;
 	}
 }
@@ -218,6 +218,10 @@ do_read(Conn *c, Ctx *ctx)
 {
 	ssize_t n;
 
+	/* Reclaim what has already been parsed before asking for more
+	 * room: one memmove per read syscall, not one per request. */
+	if (buf_room(&c->in) < READ_CHUNK)
+		buf_compact(&c->in);
 	if (buf_room(&c->in) < READ_CHUNK &&
 	    buf_grow(&c->in, READ_CHUNK, ctx->max_req) < 0) {
 		if (buf_room(&c->in) == 0) {
@@ -246,12 +250,12 @@ do_read(Conn *c, Ctx *ctx)
 static int
 do_write(Conn *c, Ctx *ctx)
 {
-	while (c->sent < c->out.len) {
-		ssize_t n = write(c->fd, c->out.p + c->sent,
-		                  c->out.len - c->sent);
+	while (buf_used(&c->out)) {
+		ssize_t n = write(c->fd, buf_data(&c->out),
+		                  buf_used(&c->out));
 
 		if (n > 0) {
-			c->sent += (size_t)n;
+			buf_drain(&c->out, (size_t)n);
 			st_add(&ctx->st->bytes_out, (u64)n);
 			continue;
 		}
@@ -261,8 +265,6 @@ do_write(Conn *c, Ctx *ctx)
 			return 0;
 		return -1;
 	}
-	c->out.len = 0;
-	c->sent = 0;
 	buf_trim(&c->out, CFG_BUF_KEEP);
 	return 0;
 }
@@ -290,16 +292,16 @@ conn_event(Conn *c, Ctx *ctx, u32 events)
 	if (do_write(c, ctx) < 0)
 		return -1;
 
-	if (c->sent < c->out.len)
+	if (buf_used(&c->out))
 		return arm(c, EPOLLOUT | EPOLLRDHUP) < 0 ? -1 : 0;
 	if (c->closing)
 		return -1;
 	/* more pipelined bytes may still be sitting in the read buffer */
-	if (c->in.len) {
+	if (buf_used(&c->in)) {
 		process(c, ctx);
 		if (do_write(c, ctx) < 0)
 			return -1;
-		if (c->sent < c->out.len)
+		if (buf_used(&c->out))
 			return arm(c, EPOLLOUT | EPOLLRDHUP) < 0 ? -1 : 0;
 		if (c->closing)
 			return -1;

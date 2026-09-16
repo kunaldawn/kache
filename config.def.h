@@ -30,6 +30,10 @@
 /* a shard's arena must hold this many maximum sized items */
 #define CFG_ARENA_ITEMS      16u
 
+/* most keys one batch request may carry; the body is bounded by
+ * CFG_MAX_VAL + CFG_REQ_SLACK as well, whichever bites first */
+#define CFG_BATCH_MAX        1024u
+
 /* hash table load factor limit, in 256ths (192/256 = 0.75) */
 #define CFG_LOAD_LIMIT       192u
 

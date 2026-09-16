@@ -18,8 +18,7 @@ typedef struct Conn {
 	int   epfd;
 	u32   events;         /* currently registered with epoll */
 	Buf   in;
-	Buf   out;
-	size_t sent;
+	Buf   out;            /* out.off is how much of it has been sent */
 	u64   atime;          /* ms of the last activity */
 	struct Conn *prev, *next;   /* activity order, oldest first */
 	struct Conn *fnext;         /* free list */
