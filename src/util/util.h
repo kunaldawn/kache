@@ -51,6 +51,7 @@ size_t fmt_u64(char *dst, u64 v);
 u64 npow2(u64 v);   /* smallest power of two >= v */
 u64 ppow2(u64 v);   /* largest power of two <= v */
 int ncpu(void);
+int ncores(void);   /* distinct physical cores, falls back to ncpu() */
 u64 entropy64(void);
 
 #endif /* KACHE_UTIL_H */

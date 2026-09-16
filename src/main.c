@@ -15,7 +15,7 @@
 #include "util/util.h"
 
 static const char usage_text[] =
-"usage: kache [-mPHnFqvh] [-l addr] [-p port] [-f file] [-s size]\n"
+"usage: kache [-mPHnMAFqvh] [-l addr] [-p port] [-f file] [-s size]\n"
 "             [-S shards] [-t threads] [-c conns] [-e ttl] [-y ms]\n"
 "             [-i idle] [-b backlog] [-B bytes] [-K bytes] [-V bytes]\n"
 "\n"
@@ -37,6 +37,8 @@ static const char usage_text[] =
 "  -P         fault the whole file in at startup\n"
 "  -H         ask for transparent huge pages\n"
 "  -n         start from an empty store\n"
+"  -M         drop optional response headers for speed\n"
+"  -A         pin each worker to one cpu\n"
 "  -F         enable POST /flush\n"
 "  -q         quiet\n"
 "  -v         print version and exit\n"
@@ -97,8 +99,10 @@ main(int argc, char *argv[])
 	sc.backlog = CFG_BACKLOG;
 	sc.sync_ms = CFG_SYNC_MS;
 	sc.default_ttl = CFG_TTL_MS ? CFG_TTL_MS : DB_FOREVER;
+	sc.minimal = CFG_MINIMAL;
+	sc.affinity = CFG_AFFINITY;
 
-	while ((opt = getopt(argc, argv, "l:p:f:s:S:t:c:e:y:i:b:B:K:V:mPHnFqvh")) != -1) {
+	while ((opt = getopt(argc, argv, "l:p:f:s:S:t:c:e:y:i:b:B:K:V:mPHnMAFqvh")) != -1) {
 		switch (opt) {
 		case 'l': sc.addr = optarg; break;
 		case 'p': sc.port = optarg; break;
@@ -118,6 +122,8 @@ main(int argc, char *argv[])
 		case 'P': mc.flags |= KM_PREFAULT; break;
 		case 'H': mc.flags |= KM_HUGE; break;
 		case 'n': mc.flags |= KM_FRESH; break;
+		case 'M': sc.minimal = 1; break;
+		case 'A': sc.affinity = 1; break;
 		case 'F': sc.allow_flush = 1; break;
 		case 'q': verbosity(0); break;
 		case 'v': puts("kache " VERSION); return 0;
@@ -137,6 +143,14 @@ main(int argc, char *argv[])
 		die("-c must be at least 1");
 	sc.default_ttl = ttl_sec ? (i64)ttl_sec * 1000 : DB_FOREVER;
 	sc.idle_ms = idle_sec * 1000;
+	/* A connection's activity stamp is only refreshed every
+	 * CFG_TOUCH_MS, so an idle timeout of the same order would close
+	 * connections that are still in the middle of a request. */
+	if (sc.idle_ms && sc.idle_ms <= (u64)CFG_TOUCH_MS * 4)
+		die("-i must be more than %u seconds, or CFG_TOUCH_MS must be "
+		    "lowered in config.h: an active connection's timestamp "
+		    "may lag by %ums", (unsigned)(CFG_TOUCH_MS * 4 / 1000),
+		    (unsigned)CFG_TOUCH_MS);
 
 	clk_init();
 	if (db_open(&db, &mc) < 0)

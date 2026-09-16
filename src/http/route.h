@@ -14,6 +14,10 @@ typedef struct Ctx {
 	size_t max_req;       /* largest request we will buffer */
 	u64    started;       /* ms since the epoch */
 	int    allow_flush;
+	int    minimal;       /* omit the headers a cache client ignores */
+	int    minimal_req;   /* minimal, unless this client needs them all;
+	                       * set by route(), read by the handlers */
+	int    head;          /* this request is a HEAD, so no body goes out */
 } Ctx;
 
 /* appends one complete response to out */

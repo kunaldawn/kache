@@ -62,8 +62,9 @@ obvious alternative and is the wrong tool here.  The critical sections are
 a probe and a `memcpy`, measured in nanoseconds; a shared lock still
 writes to the lock word, so two readers on different cores ping the same
 cache line exactly like two writers would, and the extra state machine
-buys nothing.  A read also stamps the record's access time for the LRU
-approximation, so it is a writer in all but name.  The answer to
+buys nothing.  A read writes as well - it drops a record it finds
+expired, and it stamps the record's access time for the LRU
+approximation - so it is a writer in all but name.  The answer to
 contention here is more shards, not a cleverer lock.
 
 Because a shard owns its arena as well as its index, one lock covers the
@@ -117,8 +118,18 @@ least recently used of them, jumping on anything already expired.  This is
 approximated LRU, the same trade Redis makes: no intrusive list to
 maintain on the read path, no list head to serialise on, and a quality
 that is indistinguishable from true LRU at a sample of eight.  Access time
-is a 32 bit second stamp written on every read, which is why the read path
-takes the lock exclusively.
+is a 32 bit second stamp, which is why the read path takes the lock
+exclusively.
+
+A read only rewrites that stamp once it has fallen `CFG_ATIME_SLACK`
+seconds behind.  The sampler never compares an atime against the clock,
+only against the other seven samples, so a few seconds of lag cannot
+change which of them looks oldest - while stamping every hit dirties the
+record's cache line and the mapped page under it, which is how a pure
+read ends up handing the next `msync` a page to write back.  The
+comparison is unsigned, so a record stamped ahead of the clock is
+restamped on the next read rather than frozen until the clock catches
+up.
 
 One allocation can drive several evictions.  `shd_alloc` retries up to
 `CFG_EVICT_ROUNDS` times, and each round does something smarter than
@@ -140,17 +151,40 @@ There is no sweeper thread, because a cache under load visits its own
 entries far more often than any sweeper could, and one that is idle is not
 under memory pressure.
 
-A ticker thread refreshes a cached millisecond timestamp every
-`CFG_TICK_MS`, so no request path calls `clock_gettime`.  The same thread
-reformats the HTTP `Date` header once a second into one of two buffers and
-publishes the index atomically, so a worker copies 29 bytes instead of
-calling `gmtime`.
+There is no timekeeping thread either.  A cached millisecond timestamp
+stands in for `clock_gettime` on every request path, and each worker
+refreshes it by calling `clk_update` the moment `epoll_wait` returns,
+before it reads the clock.  The cache is therefore maintained by whoever
+has work to do: under load it is fresher than a thread ticking every
+millisecond ever made it, and with the server idle it is at most one
+epoll timeout - 200 ms - stale, which nothing can observe because
+nothing is asking.  With N publishers instead of one, the timestamp is
+moved forward with a compare and swap loop rather than stored, so a
+worker preempted between reading the clock and publishing it cannot drag
+the cache backwards over a newer value; a jump back of more than a
+second is the clock actually being set, and that is followed.
+
+The same call maintains the preformatted HTTP `Date` header, so a worker
+copies 29 bytes instead of calling `gmtime`.  The once a second rebuild
+is claimed rather than scheduled: every worker crosses the second
+boundary at about the same moment, and a compare and swap on a flag
+hands the rebuild to exactly one of them.  The rest have nothing to
+contribute and go straight back to work, so nobody ever waits on it.
+That restores the single writer the two buffer scheme was designed
+around: the holder formats into whichever buffer is not published and
+then publishes the index, so a reader sees either the previous second or
+the current one and never a half written string.  Handing the buffer out
+by any scheme that lets two rebuilds overlap does not work - a stalled
+formatter would be writing the buffer a reader is holding.
 
 Durability and recovery
 -----------------------
 
-Dirty pages reach disk when the kernel decides, when the ticker's periodic
-`msync` fires (`-y`, default one second), or on a clean shutdown.  The
+Dirty pages reach disk when the kernel decides, when the periodic
+`msync` fires (`-y`, default one second), or on a clean shutdown.  With
+no separate thread to carry that flush, worker 0 runs it on a deadline of
+its own rather than folding it into the idle sweep it already performs,
+which would silently round `-y` up to the sweep's interval.  The
 header carries a clean flag, cleared on open and set on an orderly close.
 
 If that flag is missing at startup the metadata is treated as suspect,
@@ -185,6 +219,19 @@ is in the writing state - so there is no separate back pressure mechanism
 to get wrong.  Level triggering costs one extra wakeup compared to edge
 triggering in exchange for removing every drain loop and every "there may
 be more data" flag.
+
+Idle connections are found without scanning for them.  Each worker keeps
+its connections in a list ordered by activity, youngest at the tail, and
+the sweep walks from the head and stops at the first one newer than the
+cutoff.  Moving a connection to the tail on every event would pay six
+pointer writes across three cache lines to feed a sweep that runs once a
+second, so the move is coarsened to at most once per `CFG_TOUCH_MS`.
+When the move is skipped the activity stamp is deliberately left stale
+too: a fresh time at an old list position would hide every genuinely
+idle connection behind it, and their descriptors would leak.  The price
+is paid in accuracy instead - a connection can be closed up to
+`CFG_TOUCH_MS` early, never late - which is why the idle timeout has to
+stay well clear of it, checked at compile time and again against `-i`.
 
 The parser copies nothing and allocates nothing: a parsed request is a set
 of pointers into the connection's read buffer.  Only the headers the cache

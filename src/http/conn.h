@@ -19,7 +19,9 @@ typedef struct Conn {
 	u32   events;         /* currently registered with epoll */
 	Buf   in;
 	Buf   out;            /* out.off is how much of it has been sent */
-	u64   atime;          /* ms of the last activity */
+	u64   atime;          /* ms of the last activity, refreshed at most
+	                       * once per CFG_TOUCH_MS unless this is the
+	                       * newest connection; see conn_touch */
 	struct Conn *prev, *next;   /* activity order, oldest first */
 	struct Conn *fnext;         /* free list */
 	u8    open;
@@ -40,6 +42,8 @@ void  pool_fini(Pool *p);
 
 Conn *conn_open(Pool *p, int fd, int epfd, u64 now);
 void  conn_close(Pool *p, Conn *c, Stats *st);
+/* records activity, coarsened by CFG_TOUCH_MS: the list stays sorted by
+ * atime, at the price of reaping up to that much early */
 void  conn_touch(Pool *p, Conn *c, u64 now);
 /* returns -1 when the connection should be closed */
 int   conn_event(Conn *c, Ctx *ctx, u32 events);

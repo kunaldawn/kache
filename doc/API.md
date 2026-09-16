@@ -35,13 +35,23 @@ Common response headers
 | `X-Kache-TTL` | seconds left, `-1` when the entry never expires |
 | `X-Kache-Flags` | the flags stored with the value |
 
+A server started with `-M` leaves all three off a successful `GET`; see
+Minimal responses.
+
+A response to `HEAD` never carries a body, on any endpoint.  Its
+`Content-Length` still describes the body a `GET` would have returned,
+which is what makes `HEAD` useful for asking a key's size without
+fetching it.
+
 Endpoints
 ---------
 
 ### `GET /kv/<key>` and `HEAD /kv/<key>`
 
 `200` with the value as `application/octet-stream`, or `404`.  `HEAD`
-sends the same headers, `Content-Length` included, and no body.
+sends the same headers, `Content-Length` included, and no body.  A `GET`
+here is the one response `-M` takes metadata away from; a `HEAD` keeps
+it, having no body to save the bytes on.
 
 ### `PUT /kv/<key>`, `POST /kv/<key>`
 
@@ -55,7 +65,9 @@ replaced a value.  Conditional forms:
 | `If-Match: "<etag>"` | store only if the value is unchanged | `412` |
 
 A compare and swap is therefore a `GET` followed by a `PUT` carrying the
-`ETag` you read, and `412` means someone got there first.
+`ETag` you read, and `412` means someone got there first.  Under `-M` the
+read has no `ETag` to give you, so keep the one the write that produced
+the version already returned.
 
 ### `DELETE /kv/<key>`
 
@@ -173,6 +185,42 @@ with a `# TYPE` line each.
 
 A plain text summary of the above.
 
+Minimal responses
+-----------------
+
+`-M` (`CFG_MINIMAL` at build time) drops the headers a cache client
+rarely reads back.  `Server: kache` goes from every response;
+`Connection: keep-alive` goes when the connection is being kept alive,
+which is the HTTP/1.1 default and needs no saying, while
+`Connection: close` is still always sent; and a successful `GET` of
+`/kv/<key>` loses its `Content-Type` along with the `ETag`,
+`X-Kache-TTL` and `X-Kache-Flags` trio.  A `HEAD` of the same key keeps
+all of them: it returns no body, so there is nothing for the elision to
+save, and metadata is the whole reason to ask.  Nothing else moves.
+`Date` and
+`Content-Length` stay, every other endpoint keeps its `Content-Type`,
+and the status codes are the ones they always were.
+
+Writes keep their metadata.  `PUT`, `POST`, `DELETE`, `/incr`,
+`/append`, `/touch` and the batch endpoints lose only the two headers
+every response loses, never the `ETag`, `X-Kache-TTL` and
+`X-Kache-Flags`, so the token a compare and swap needs is still handed
+back by the write that minted it, and `If-Match` and `If-None-Match`
+work as they always did.  Only the read side goes quiet.
+
+It never applies to an HTTP/1.0 client.  Such a client keeps the
+connection only when the server echoes `Connection: keep-alive`, and
+that echo is the thing minimal mode stops sending, so a request that
+announces `HTTP/1.0` gets the full header set whatever the server was
+started with.
+
+What it buys is bytes: for a 64 byte value the header block goes from
+201 bytes down to 76, and the whole response from 265 to 140.  What it
+costs is the read side metadata, so `-M` suits a client that gets a
+value and wants the bytes, and does not suit one that reads a key to
+learn its `ETag` or its remaining TTL - though such a client can use
+`HEAD`, which keeps them.
+
 Status codes
 ------------
 
@@ -208,6 +256,10 @@ Examples
     # compare and swap
     etag=$(curl -sI localhost:7070/kv/sess/abc | sed -n 's/^ETag: //p' | tr -d '\r')
     curl -X PUT -H "If-Match: $etag" -d 'new data' localhost:7070/kv/sess/abc
+
+    # under -M a read carries no ETag, so keep the one the write gave back
+    etag=$(curl -s -D - -o /dev/null -X PUT -d 'session data' \
+           localhost:7070/kv/sess/abc | sed -n 's/^ETag: //p' | tr -d '\r')
 
     # take a lock that expires by itself
     curl -f -X PUT -H 'If-None-Match: *' -d held 'localhost:7070/kv/lock?ttl=30'

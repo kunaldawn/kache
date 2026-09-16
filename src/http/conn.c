@@ -12,6 +12,15 @@
 
 #define READ_CHUNK 16384
 
+/* conn_touch lets a connection's atime lag its real activity by up to
+ * CFG_TOUCH_MS, and reap_idle's own tick adds a second on top, so an
+ * idle timeout anywhere near either would reap live traffic.  Four times
+ * is the margin that leaves both comfortably inside it; main.c holds -i
+ * to the same bound at runtime. */
+_Static_assert(CFG_TOUCH_MS == 0 || CFG_IDLE_MS == 0 ||
+               CFG_TOUCH_MS * 4 <= CFG_IDLE_MS,
+               "CFG_TOUCH_MS must stay well below CFG_IDLE_MS");
+
 /* ---- pool ------------------------------------------------------------ */
 
 void
@@ -74,9 +83,20 @@ list_append(Pool *p, Conn *c)
 void
 conn_touch(Pool *p, Conn *c, u64 now)
 {
-	c->atime = now;
-	if (p->tail == c)
+	if (p->tail == c) {
+		c->atime = now;
 		return;
+	}
+	/* Relinking on every event pays six pointer writes across three
+	 * cache lines to feed a sweep that runs once a second.  The skip
+	 * path has to leave atime alone as well: reap_idle stops at the
+	 * first connection newer than the cutoff, so a fresh atime at a
+	 * stale list position would hide every idle connection behind it
+	 * and leak their descriptors.  Accuracy pays instead - a
+	 * connection may be reaped up to CFG_TOUCH_MS early, never late. */
+	if (CFG_TOUCH_MS && now - c->atime < CFG_TOUCH_MS)
+		return;
+	c->atime = now;
 	list_unlink(p, c);
 	list_append(p, c);
 }
@@ -155,10 +175,13 @@ conn_close(Pool *p, Conn *c, Stats *st)
 
 /* ---- request processing ---------------------------------------------- */
 
+/* Reaches past minimal_req to the configured flag on purpose: bail is the
+ * answer to a request that never reached route(), and it always closes,
+ * so the keep-alive echo minimal_req exists to protect is not at stake. */
 static void
-bail(Conn *c, int status)
+bail(Conn *c, Ctx *ctx, int status)
 {
-	http_simple(&c->out, status, clk_date(), 0);
+	http_simple(&c->out, status, clk_date(), 0, ctx->minimal);
 	c->closing = 1;
 }
 
@@ -176,22 +199,22 @@ process(Conn *c, Ctx *ctx)
 		              buf_used(&c->in), &r);
 		if (n == 0) {
 			if (buf_used(&c->in) >= ctx->max_req)
-				bail(c, 431);
+				bail(c, ctx, 431);
 			return;
 		}
 		if (n < 0) {
 			st_inc(&ctx->st->errors);
-			bail(c, -n);
+			bail(c, ctx, -n);
 			return;
 		}
 		total = (size_t)n + r.clen;
 		if (r.clen > ctx->max_req || total > ctx->max_req) {
 			st_inc(&ctx->st->errors);
-			bail(c, 413);
+			bail(c, ctx, 413);
 			return;
 		}
 		if (buf_used(&c->in) < total) {
-			if (r.expect100 && !c->continued) {
+			if (r.expect100 && r.minor && !c->continued) {
 				buf_puts(&c->out,
 				    "HTTP/1.1 100 Continue\r\n\r\n");
 				c->continued = 1;
@@ -226,7 +249,7 @@ do_read(Conn *c, Ctx *ctx)
 	    buf_grow(&c->in, READ_CHUNK, ctx->max_req) < 0) {
 		if (buf_room(&c->in) == 0) {
 			st_inc(&ctx->st->errors);
-			bail(c, 413);
+			bail(c, ctx, 413);
 			return 0;
 		}
 	}

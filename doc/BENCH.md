@@ -96,6 +96,15 @@ Getting numbers worth trusting
 - Compare only results from the same machine.  `kache-cmp` prints a
   warning when the hostnames differ, because nothing else about the
   comparison would be meaningful.
+- Treat a `WORSE` row against a baseline from another sitting as a
+  question, not an answer.  A baseline recorded hours earlier measured a
+  different machine, whatever the hostname says.  Settle it by running
+  the two binaries alternately, one pair after another, and taking the
+  median of the per-pair ratios; only that cancels drift.  The
+  re-baselining that followed the work in `doc/PERF.md` threw three rows
+  at 10 to 23% worse, and an interleaved pair put all three inside half
+  a percent - the old baseline was simply recorded on a faster-running
+  machine.
 
 The result file
 ---------------

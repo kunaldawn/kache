@@ -52,16 +52,19 @@ int  etag_value(Str s, u64 *out);
 const char *http_status(int code);
 
 /* Response headers are built on the stack, then prepended to a body that
- * is already sitting in the output buffer. */
+ * is already sitting in the output buffer.  Minimal mode drops the
+ * headers a cache client rarely reads back; the flag rides in the Hdrs
+ * so hdrs_end does not have to be told a second time. */
 #define HDRS_MAX 512
 
 typedef struct Hdrs {
 	char   b[HDRS_MAX];
 	size_t n;
 	int    status;
+	int    minimal;
 } Hdrs;
 
-void hdrs_start(Hdrs *h, int status, const char *date);
+void hdrs_start(Hdrs *h, int status, const char *date, int minimal);
 void hdrs_add(Hdrs *h, const char *name, const char *val, size_t n);
 #define hdrs_lit(h, name, val) hdrs_add((h), (name), (val), sizeof(val) - 1)
 void hdrs_num(Hdrs *h, const char *name, i64 v);
@@ -71,6 +74,7 @@ void hdrs_end(Hdrs *h, size_t clen, int keepalive);
 /* insert the finished headers in front of the body appended at mark */
 void http_wrap(Buf *out, size_t mark, const Hdrs *h);
 /* a complete response with no body of its own */
-void http_simple(Buf *out, int status, const char *date, int keepalive);
+void http_simple(Buf *out, int status, const char *date, int keepalive,
+                 int minimal);
 
 #endif /* KACHE_HTTP_H */

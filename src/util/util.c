@@ -167,18 +167,45 @@ parse_i64(const char *s, size_t n, i64 *out)
 	return 0;
 }
 
+/* About five numbers are formatted into every response, so the digits
+ * come out two at a time: one division per pair instead of per digit,
+ * and the pair itself is a table lookup. */
+static const char digits2[201] =
+	"00010203040506070809" "10111213141516171819"
+	"20212223242526272829" "30313233343536373839"
+	"40414243444546474849" "50515253545556575859"
+	"60616263646566676869" "70717273747576777879"
+	"80818283848586878889" "90919293949596979899";
+
 size_t
 fmt_u64(char *dst, u64 v)
 {
-	char tmp[20];
-	size_t n = 0, i;
+	char tmp[20], *p = tmp + sizeof(tmp);
+	size_t n;
 
-	do {
-		tmp[n++] = (char)('0' + (v % 10));
-		v /= 10;
-	} while (v);
-	for (i = 0; i < n; i++)
-		dst[i] = tmp[n - 1 - i];
+	/* built from the back, so there is no reversal pass afterwards */
+	while (v >= 100) {
+		u64 q = v / 100;
+		unsigned r = (unsigned)(v - q * 100) * 2;
+
+		p -= 2;
+		p[0] = digits2[r];
+		p[1] = digits2[r + 1];
+		v = q;
+	}
+	if (v >= 10) {
+		unsigned r = (unsigned)v * 2;
+
+		p -= 2;
+		p[0] = digits2[r];
+		p[1] = digits2[r + 1];
+	} else {
+		*--p = (char)('0' + (unsigned)v);
+	}
+	/* callers size their buffers on the return value, and several
+	 * write into a fixed slot, so never touch dst beyond n */
+	n = (size_t)(tmp + sizeof(tmp) - p);
+	memcpy(dst, p, n);
 	return n;
 }
 
@@ -214,6 +241,48 @@ ncpu(void)
 	long n = sysconf(_SC_NPROCESSORS_ONLN);
 
 	return n > 0 ? (int)n : 1;
+}
+
+/* Physical cores, for the callers that want one worker per core rather
+ * than per hardware thread.  A cpu is counted only when it is the first
+ * entry of its own sibling list, so a sibling group contributes exactly
+ * one core and no set is needed.  Anything we cannot account for - no
+ * sysfs, a kernel without topology, online cpus whose files we never
+ * found - falls back to ncpu(), which is never wrong, only pessimistic. */
+int
+ncores(void)
+{
+	char path[80], buf[32];
+	int n = ncpu(), seen = 0, cores = 0, i;
+
+	/* ids are normally dense, so this is n opens; the cap only keeps
+	 * a sparse or half offline machine from scanning forever */
+	for (i = 0; seen < n && i < n * 4 + 64; i++) {
+		unsigned first = 0;
+		const char *p;
+		ssize_t r;
+		int fd;
+
+		snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d"
+		    "/topology/thread_siblings_list", i);
+		if ((fd = open(path, O_RDONLY | O_CLOEXEC)) < 0)
+			continue;   /* offline, or not a cpu at all */
+		r = read(fd, buf, sizeof(buf) - 1);
+		close(fd);
+		if (r <= 0)
+			return n;
+		buf[r] = '\0';
+		seen++;
+		for (p = buf; *p >= '0' && *p <= '9'; p++)
+			first = first * 10 + (unsigned)(*p - '0');
+		/* the list is sorted, so a first entry above our own id
+		 * means we are not reading what we think we are */
+		if (p == buf || first > (unsigned)i)
+			return n;
+		if (first == (unsigned)i)
+			cores++;
+	}
+	return (seen == n && cores > 0) ? cores : n;
 }
 
 u64

@@ -277,27 +277,35 @@ etag_value(Str s, u64 *out)
 	return parse_u64(s.p, s.n, out);
 }
 
+/* Every status the server can answer with.  One list feeds both the
+ * phrase lookup and the status line table below, so the two cannot
+ * drift apart when a code is added. */
+#define HTTP_STATUS_LIST(X)                                            \
+	X(100, "Continue")                                             \
+	X(200, "OK")                                                   \
+	X(201, "Created")                                              \
+	X(204, "No Content")                                           \
+	X(400, "Bad Request")                                          \
+	X(403, "Forbidden")                                            \
+	X(404, "Not Found")                                            \
+	X(405, "Method Not Allowed")                                   \
+	X(409, "Conflict")                                             \
+	X(412, "Precondition Failed")                                  \
+	X(413, "Payload Too Large")                                    \
+	X(414, "URI Too Long")                                         \
+	X(431, "Request Header Fields Too Large")                      \
+	X(500, "Internal Server Error")                                \
+	X(501, "Not Implemented")                                      \
+	X(505, "HTTP Version Not Supported")                           \
+	X(507, "Insufficient Storage")
+
 const char *
 http_status(int code)
 {
 	switch (code) {
-	case 100: return "Continue";
-	case 200: return "OK";
-	case 201: return "Created";
-	case 204: return "No Content";
-	case 400: return "Bad Request";
-	case 404: return "Not Found";
-	case 405: return "Method Not Allowed";
-	case 409: return "Conflict";
-	case 412: return "Precondition Failed";
-	case 413: return "Payload Too Large";
-	case 414: return "URI Too Long";
-	case 431: return "Request Header Fields Too Large";
-	case 403: return "Forbidden";
-	case 500: return "Internal Server Error";
-	case 501: return "Not Implemented";
-	case 505: return "HTTP Version Not Supported";
-	case 507: return "Insufficient Storage";
+#define X(code, txt) case code: return txt;
+	HTTP_STATUS_LIST(X)
+#undef X
 	}
 	return "Error";
 }
@@ -319,18 +327,39 @@ lit(Hdrs *h, const char *s)
 	raw(h, s, strlen(s));
 }
 
-void
-hdrs_start(Hdrs *h, int status, const char *date)
+/* Once the code is known the whole line is fixed text, so a code in the
+ * table costs one memcpy of a length the compiler has folded, instead of
+ * formatting the number and then strlen()ing a phrase it cannot see
+ * through http_status(). */
+static void
+status_line(Hdrs *h, int status)
 {
-	const char *txt = http_status(status);
-
-	h->n = 0;
-	h->status = status;
+	switch (status) {
+#define X(code, txt)                                                   \
+	case code:                                                     \
+		raw(h, "HTTP/1.1 " #code " " txt "\r\n",               \
+		    sizeof("HTTP/1.1 " #code " " txt "\r\n") - 1);     \
+		return;
+	HTTP_STATUS_LIST(X)
+#undef X
+	}
 	lit(h, "HTTP/1.1 ");
 	h->n += fmt_u64(h->b + h->n, (u64)status);
 	raw(h, " ", 1);
-	lit(h, txt);
-	lit(h, "\r\nServer: kache\r\nDate: ");
+	lit(h, http_status(status));
+	lit(h, "\r\n");
+}
+
+void
+hdrs_start(Hdrs *h, int status, const char *date, int minimal)
+{
+	h->n = 0;
+	h->status = status;
+	h->minimal = minimal;
+	status_line(h, status);
+	/* Date is the one header HTTP asks an origin server for, so even
+	 * minimal mode keeps it; nothing but a log reads Server. */
+	lit(h, minimal ? "Date: " : "Server: kache\r\nDate: ");
 	raw(h, date, CLK_DATE_LEN);
 	lit(h, "\r\n");
 }
@@ -369,8 +398,13 @@ hdrs_end(Hdrs *h, size_t clen, int keepalive)
 	/* a 204 carries no message body, not even a zero length one */
 	if (h->status != 204)
 		hdrs_num(h, "Content-Length", (i64)clen);
-	lit(h, keepalive ? "Connection: keep-alive\r\n\r\n"
-	                 : "Connection: close\r\n\r\n");
+	/* keep-alive is already the HTTP/1.1 default, so minimal mode
+	 * leaves it unsaid; close is not the default and must be said */
+	if (!keepalive)
+		lit(h, "Connection: close\r\n\r\n");
+	else
+		lit(h, h->minimal ? "\r\n"
+		                  : "Connection: keep-alive\r\n\r\n");
 }
 
 void
@@ -380,11 +414,12 @@ http_wrap(Buf *out, size_t mark, const Hdrs *h)
 }
 
 void
-http_simple(Buf *out, int status, const char *date, int keepalive)
+http_simple(Buf *out, int status, const char *date, int keepalive,
+            int minimal)
 {
 	Hdrs h;
 
-	hdrs_start(&h, status, date);
+	hdrs_start(&h, status, date, minimal);
 	hdrs_end(&h, 0, keepalive);
 	buf_put(out, h.b, h.n);
 }

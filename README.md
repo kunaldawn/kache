@@ -43,7 +43,8 @@ Layout
     test/cmp.c       diffs two benchmark runs
     test/bench.sh    runs the suite and writes one result file
     doc/             design notes, HTTP reference, benchmarking,
-                     a measured comparison against Redis, man page
+                     a measured comparison against Redis, what was
+                     profiled and what came of it, man page
 
 Each layer only ever includes downwards: `http/` knows about `store/`,
 `store/` knows about `util/`, and nothing knows about `http/`.
@@ -84,9 +85,11 @@ run is big enough - which is how a 60 KiB value still gets in when the
 arena is a mosaic of 500 byte records.
 
 **Time.**  Expiry is an absolute wall clock millisecond stamp, so TTLs
-mean the same thing across a restart.  A ticker thread refreshes a cached
-timestamp, and the preformatted HTTP `Date` header with it, so request
-handling never enters the clock.
+mean the same thing across a restart.  Every worker refreshes a cached
+timestamp as its `epoll_wait` returns, and once a second one of them
+rebuilds the preformatted HTTP `Date` header with it, so request handling
+never enters the clock and no thread exists only to watch it.  Worker 0
+carries the periodic `msync` on the same principle.
 
 **Recovery.**  A clean shutdown sets a flag in the header.  If that flag
 is missing on open, the index and free lists are not trusted: the arena
@@ -145,6 +148,9 @@ starts over.  The knobs that matter:
     -t n       worker threads, 0 for one per cpu
     -m         mlock the store so it can never be paged out
     -P         fault the whole file in at startup
+    -M         drop the optional response headers; doc/API.md lists
+               exactly which, and which are kept regardless
+    -A         pin each worker to one cpu
 
 Building and testing
 --------------------

@@ -113,7 +113,26 @@ db_get(Db *db, const void *k, u32 kl, void *out, u32 cap, DbMeta *meta)
 		meta_of(meta, r, now, 0);
 		rc = DB_ESMALL;
 	} else {
-		r->atime = (u32)(now / 1000);
+		u32 sec = (u32)(now / 1000);
+
+		/* Stamping every hit dirties the record's cache line and
+		 * the mmap page under it, so a pure read hands the next
+		 * msync a page to write back.  Sampled LRU only ranks
+		 * atimes against each other, so letting one lag a few
+		 * seconds costs it nothing.  The difference is unsigned on
+		 * purpose: a record stamped ahead of the clock - an NTP
+		 * step back, or a file written on a machine that was
+		 * further ahead - wraps to a huge difference and so is
+		 * restamped on the next read, instead of going untouched
+		 * until the clock catches up.  The branch is preprocessor
+		 * rather than plain code because at slack 0 the comparison
+		 * is always true, and -Wextra says so. */
+#if CFG_ATIME_SLACK
+		if ((u32)(sec - r->atime) >= (u32)CFG_ATIME_SLACK)
+			r->atime = sec;
+#else
+		r->atime = sec;
+#endif
 		memcpy(out, rec_val(r), r->vlen);
 		meta_of(meta, r, now, 0);
 	}

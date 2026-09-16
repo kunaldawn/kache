@@ -6,7 +6,7 @@
 .Nd multi threaded, file backed key/value cache with an HTTP interface
 .Sh SYNOPSIS
 .Nm
-.Op Fl mPHnFqvh
+.Op Fl mPHnMAFqvh
 .Op Fl l Ar addr
 .Op Fl p Ar port
 .Op Fl f Ar file
@@ -70,7 +70,11 @@ the mapping in the background.  Zero leaves writeback entirely to the
 kernel.  Default
 .Ql 1000 .
 .It Fl i Ar idle
-Seconds a connection may sit idle before it is closed.  Default
+Seconds a connection may sit idle before it is closed.  The activity
+stamp on a connection is only refreshed every
+.Dv CFG_TOUCH_MS ,
+so a connection may be closed up to that much early, never late.
+Default
 .Ql 60 .
 .It Fl b Ar backlog
 Listen backlog.  Default
@@ -100,6 +104,39 @@ Advise the kernel that the mapping may use transparent huge pages.
 .It Fl n
 Discard any existing contents and create the store afresh.  Required to
 change the geometry of an existing file.
+.It Fl M
+Minimal responses.  The
+.Ql Server
+header is dropped from every response,
+.Ql Connection: keep-alive
+is dropped when the connection is in fact being kept alive, and a
+successful
+.Cm GET
+of
+.Ar /kv/<key>
+also drops
+.Ql Content-Type
+and the
+.Ql ETag ,
+.Ql X-Kache-TTL
+and
+.Ql X-Kache-Flags
+trio.  A
+.Cm HEAD
+of the same key keeps them: it returns no body, so the elision would
+save nothing, and metadata is the whole reason to ask.
+.Ql Connection: close
+is still always sent.  Responses to writes keep every header they
+otherwise would, so compare and swap and conditional requests still
+work; an HTTP/1.0 client, which needs the keep alive echo, is never
+answered minimally either.
+.It Fl A
+Pin each worker to one cpu,
+.Li i % ncpu ,
+so its stack and its connection buffers stay on the core that faulted
+them in.  Worth having when nothing else on the machine wants those
+cpus, and worth not having when something does.  A kernel that refuses
+is warned about, not fatal.
 .It Fl F
 Enable
 .Ql POST /flush .

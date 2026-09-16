@@ -8,10 +8,13 @@ BIN=./kache
 URL="http://127.0.0.1:$PORT"
 fails=0
 pid=
+pid2=
 
 cleanup() {
 	[ -n "$pid" ] && kill "$pid" 2>/dev/null
 	wait "$pid" 2>/dev/null
+	[ -n "$pid2" ] && kill "$pid2" 2>/dev/null
+	wait "$pid2" 2>/dev/null
 	rm -rf "$DIR"
 }
 trap cleanup EXIT INT TERM
@@ -51,6 +54,24 @@ body() {
 
 hdr() {
 	curl -sS -m 10 -D - -o /dev/null "$@" | tr -d '\r'
+}
+
+# has NAME HEADERS PATTERN - the header block must carry the line
+has() {
+	if printf '%s\n' "$2" | grep -q "$3"; then
+		ok "$1"
+	else
+		bad "$1" "no line matching $3"
+	fi
+}
+
+# lacks NAME HEADERS PATTERN - and must not
+lacks() {
+	if printf '%s\n' "$2" | grep -q "$3"; then
+		bad "$1" "unexpected line matching $3"
+	else
+		ok "$1"
+	fi
 }
 
 [ -x "$BIN" ] || { echo "build kache first"; exit 1; }
@@ -187,6 +208,78 @@ while ! curl -sS -m 1 -o /dev/null "$URL/health" 2>/dev/null; do
 	sleep 0.1
 done
 body  "survived a crash"  survivor "$URL/kv/keep"
+
+echo "key decoding"
+check "escaped key put"   201 -X PUT -d roundtrip "$URL/kv/abc"
+body  "escaped key get"   roundtrip "$URL/kv/%61%62c"
+kmax=$(printf 'k%.0s' $(seq 1 255))
+check "key at the limit"  201 -X PUT -d atmax "$URL/kv/$kmax"
+body  "limit key readback" atmax "$URL/kv/$kmax"
+check "key over the limit" 414 -X PUT -d over "$URL/kv/${kmax}k"
+# 765 raw bytes of escapes decoding to the same 255 byte key: the case that
+# breaks if the length test is hoisted out of the unescaped branch
+kesc=$(printf '%%6b%.0s' $(seq 1 255))
+body  "all escape key"    atmax "$URL/kv/$kesc"
+
+echo "minimal responses"
+PORT2=${PORT2:-$((PORT + 1))}
+URL2="http://127.0.0.1:$PORT2"
+"$BIN" -f "$DIR/min.db" -s 64M -p "$PORT2" -F -q -M >>"$DIR/log" 2>&1 &
+pid2=$!
+i=0
+while ! curl -sS -m 1 -o /dev/null "$URL2/health" 2>/dev/null; do
+	i=$((i + 1))
+	[ $i -gt 50 ] && { echo "minimal server did not start"; cat "$DIR/log"; exit 1; }
+	sleep 0.1
+done
+
+check "minimal put"       201 -X PUT -d minimal "$URL2/kv/m"
+h=$(hdr "$URL2/kv/m")
+lacks "minimal no server"     "$h" '^Server:'
+lacks "minimal no type"       "$h" '^Content-Type:'
+lacks "minimal no etag"       "$h" '^ETag:'
+lacks "minimal no ttl"        "$h" '^X-Kache-TTL:'
+lacks "minimal no flags"      "$h" '^X-Kache-Flags:'
+lacks "minimal no connection" "$h" '^Connection:'
+has   "minimal keeps date"    "$h" '^Date: ...,'
+has   "minimal length"        "$h" '^Content-Length: 7$'
+printf 'one\ntwo\n' > "$DIR/mbody"
+curl -sS -m 10 -o /dev/null -X PUT --data-binary "@$DIR/mbody" "$URL2/kv/mb"
+curl -sS -m 10 -o "$DIR/mgot" "$URL2/kv/mb"
+cmp -s "$DIR/mbody" "$DIR/mgot" && ok "minimal body intact" \
+	|| bad "minimal body intact" "value came back changed"
+has   "minimal binary length" "$(hdr "$URL2/kv/mb")" '^Content-Length: 8$'
+
+# the write side keeps every header, so cas and conditionals still work
+etag2=$(hdr -X PUT -d v1 "$URL2/kv/c" | sed -n 's/^ETag: "\(.*\)"$/\1/p')
+[ -n "$etag2" ] && ok "minimal put etag" || bad "minimal put etag" "no ETag"
+check "minimal cas match"    204 -X PUT -H "If-Match: \"$etag2\"" -d v2 "$URL2/kv/c"
+check "minimal cas stale"    412 -X PUT -H "If-Match: \"$etag2\"" -d v3 "$URL2/kv/c"
+body  "minimal cas applied"  v2 "$URL2/kv/c"
+has   "minimal closes"       "$(hdr -H 'Connection: close' "$URL2/kv/m")" \
+	'^Connection: close$'
+
+# reply_text is not what minimal mode trims, so the type survives, but
+# hdrs_end still leaves the keep-alive line unsaid
+h=$(hdr "$URL2/kv/absent")
+has   "minimal 404 type"       "$h" '^Content-Type: text/plain; charset=utf-8$'
+lacks "minimal 404 connection" "$h" '^Connection:'
+
+# deliberate asymmetry: the framed body cannot be read without these
+printf 'm\nabsent\n' > "$DIR/mkeys2"
+h=$(hdr -X POST --data-binary "@$DIR/mkeys2" "$URL2/mget")
+has   "minimal mget type"  "$h" '^Content-Type: application/octet-stream$'
+has   "minimal mget count" "$h" '^X-Kache-Count: 2$'
+
+# and the default server still says all of it
+check "default put"        201 -X PUT -d normal "$URL/kv/full"
+h=$(hdr "$URL/kv/full")
+has   "default server"     "$h" '^Server: kache$'
+has   "default type"       "$h" '^Content-Type: application/octet-stream$'
+has   "default etag"       "$h" '^ETag: "'
+has   "default ttl"        "$h" '^X-Kache-TTL:'
+has   "default flags"      "$h" '^X-Kache-Flags:'
+has   "default keep-alive" "$h" '^Connection: keep-alive$'
 
 echo
 if [ "$fails" -eq 0 ]; then

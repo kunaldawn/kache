@@ -19,6 +19,8 @@ typedef struct ServerCfg {
 	u64         sync_ms;
 	i64         default_ttl;
 	int         allow_flush;
+	int         minimal;    /* drop the read side metadata headers */
+	int         affinity;   /* pin worker i to cpu i % ncpu() */
 } ServerCfg;
 
 int server_run(Db *db, const ServerCfg *cfg);

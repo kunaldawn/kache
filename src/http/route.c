@@ -18,25 +18,36 @@ typedef struct Key {
 
 /* ---- small response helpers ----------------------------------------- */
 
+/* A response to HEAD ends with its header block: a body left behind would
+ * be read as the start of the next response on a kept alive connection.
+ * Content-Length still describes what a GET would have returned. */
 static void
-reply_text(Buf *out, int status, int ka, const char *msg, size_t n)
+no_body(Buf *out, size_t mark, const Hdrs *h, int head)
+{
+	if (head)
+		out->len = mark + h->n;
+}
+
+static void
+reply_text(Ctx *c, Buf *out, int status, int ka, const char *msg, size_t n)
 {
 	size_t mark = out->len;
 	Hdrs h;
 
 	buf_put(out, msg, n);
 	buf_putc(out, '\n');
-	hdrs_start(&h, status, clk_date());
+	hdrs_start(&h, status, clk_date(), c->minimal_req);
 	hdrs_lit(&h, "Content-Type", CT_TXT);
 	hdrs_end(&h, out->len - mark, ka);
 	http_wrap(out, mark, &h);
+	no_body(out, mark, &h, c->head);
 }
 
 static void
 fail(Ctx *c, Buf *out, int status, int ka, const char *msg)
 {
 	st_inc(&c->st->errors);
-	reply_text(out, status, ka, msg, strlen(msg));
+	reply_text(c, out, status, ka, msg, strlen(msg));
 }
 
 /* every failure the store can report, mapped onto a status */
@@ -82,6 +93,19 @@ take_key(Str rest, Key *k)
 		return -1;
 	if (rest.n > KEYMAX * 3)
 		return -2;
+	/* url_decode costs a bounds check per byte and hardly any key
+	 * carries an escape.  Without one the decoded length is the raw
+	 * length, so the same inputs still fail with the same codes.  The
+	 * length test has to stay in here: an escaped key may be up to
+	 * three times KEYMAX raw and still decode to a legal one. */
+	if (LIKELY(!memchr(rest.p, '%', rest.n))) {
+		if (rest.n > KEYMAX)
+			return -2;
+		memcpy(k->c, rest.p, rest.n);
+		k->c[rest.n] = '\0';
+		k->n = (u32)rest.n;
+		return 0;
+	}
 	if ((n = url_decode(rest.p, rest.n, k->c, sizeof(k->c) - 1)) < 0)
 		return rest.n > KEYMAX ? -2 : -1;
 	if (n == 0)
@@ -188,15 +212,23 @@ do_get(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
 	if (rc != DB_OK) {
 		st_inc(&c->st->misses);
 		if (rc == DB_ENOENT)
-			reply_text(out, 404, ka, "not found", 9);
+			reply_text(c, out, 404, ka, "not found", 9);
 		else
 			fail_db(c, out, rc, ka);
 		return;
 	}
 	st_inc(&c->st->hits);
-	hdrs_start(&h, 200, clk_date());
-	hdrs_lit(&h, "Content-Type", CT_BIN);
-	meta_headers(&h, &m);
+	hdrs_start(&h, 200, clk_date(), c->minimal_req);
+	/* Minimal mode withholds the read side metadata, and only here:
+	 * hdrs_start and hdrs_end drop Server and the keep-alive echo from
+	 * every response, but a write still answers with the ETag and TTL
+	 * that feed CAS.  A HEAD keeps them too - it returns no bytes, so
+	 * the elision would save nothing, and metadata is the whole point
+	 * of asking. */
+	if (!c->minimal_req || head) {
+		hdrs_lit(&h, "Content-Type", CT_BIN);
+		meta_headers(&h, &m);
+	}
 	hdrs_end(&h, m.vlen, ka);
 	http_wrap(out, mark, &h);
 }
@@ -248,7 +280,7 @@ do_put(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
 		return;
 	}
 	st_inc(&c->st->sets);
-	hdrs_start(&h, m.created ? 201 : 204, clk_date());
+	hdrs_start(&h, m.created ? 201 : 204, clk_date(), c->minimal_req);
 	meta_headers(&h, &m);
 	hdrs_end(&h, 0, ka);
 	buf_put(out, h.b, h.n);
@@ -273,7 +305,7 @@ do_del(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
 		return;
 	}
 	st_inc(&c->st->dels);
-	http_simple(out, 204, clk_date(), ka);
+	http_simple(out, 204, clk_date(), ka, c->minimal_req);
 }
 
 static void
@@ -312,7 +344,7 @@ do_incr(Ctx *c, const Req *r, Buf *out, int ka, const Key *k, int sign)
 	}
 	st_inc(&c->st->incrs);
 	buf_puti(out, result);
-	hdrs_start(&h, 200, clk_date());
+	hdrs_start(&h, 200, clk_date(), c->minimal_req);
 	hdrs_lit(&h, "Content-Type", CT_TXT);
 	meta_headers(&h, &m);
 	hdrs_end(&h, out->len - mark, ka);
@@ -332,7 +364,7 @@ do_cat(Ctx *c, const Req *r, Buf *out, int ka, const Key *k, int prepend)
 		return;
 	}
 	st_inc(&c->st->cats);
-	hdrs_start(&h, 204, clk_date());
+	hdrs_start(&h, 204, clk_date(), c->minimal_req);
 	meta_headers(&h, &m);
 	hdrs_num(&h, "X-Kache-Length", (i64)m.vlen);
 	hdrs_end(&h, 0, ka);
@@ -356,7 +388,7 @@ do_touch(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
 		return;
 	}
 	st_inc(&c->st->touches);
-	hdrs_start(&h, 204, clk_date());
+	hdrs_start(&h, 204, clk_date(), c->minimal_req);
 	meta_headers(&h, &m);
 	hdrs_end(&h, 0, ka);
 	buf_put(out, h.b, h.n);
@@ -438,10 +470,11 @@ do_stats(Ctx *c, Buf *out, int ka, int prom)
 		buf_putu(out, mt[i].v);
 		buf_putc(out, '\n');
 	}
-	hdrs_start(&h, 200, clk_date());
+	hdrs_start(&h, 200, clk_date(), c->minimal_req);
 	hdrs_lit(&h, "Content-Type", CT_TXT);
 	hdrs_end(&h, out->len - mark, ka);
 	http_wrap(out, mark, &h);
+	no_body(out, mark, &h, c->head);
 }
 
 static const char index_page[] =
@@ -501,6 +534,11 @@ route(Ctx *c, const Req *r, Buf *out, int *keepalive)
 
 	st_inc(&c->st->requests);
 	*keepalive = ka;
+	/* An HTTP/1.0 client only keeps the connection when the server
+	 * echoes Connection: keep-alive, and minimal mode is exactly the
+	 * mode that stops echoing it.  So it never applies to one. */
+	c->minimal_req = c->minimal && r->minor;
+	c->head = (r->meth == M_HEAD);
 
 	if (prefixed(r->path, "/kv/", 4, &rest)) {
 		if (key_or_fail(c, out, ka, rest, &k) < 0)
@@ -564,7 +602,7 @@ route(Ctx *c, const Req *r, Buf *out, int *keepalive)
 			return;
 		}
 		db_flush(c->db);
-		http_simple(out, 204, clk_date(), ka);
+		http_simple(out, 204, clk_date(), ka, c->minimal_req);
 		return;
 	}
 	if (r->meth == M_GET || r->meth == M_HEAD) {
@@ -577,11 +615,11 @@ route(Ctx *c, const Req *r, Buf *out, int *keepalive)
 			return;
 		}
 		if (r->path.n == 7 && !memcmp(r->path.p, "/health", 7)) {
-			reply_text(out, 200, ka, "ok", 2);
+			reply_text(c, out, 200, ka, "ok", 2);
 			return;
 		}
 		if (r->path.n == 1) {
-			reply_text(out, 200, ka, index_page,
+			reply_text(c, out, 200, ka, index_page,
 			           sizeof(index_page) - 1);
 			return;
 		}
@@ -705,7 +743,7 @@ do_mget(Ctx *c, const Req *r, Buf *out, int ka, int del)
 
 	if (del) {
 		st_add(&c->st->dels, found);
-		hdrs_start(&h, 204, clk_date());
+		hdrs_start(&h, 204, clk_date(), c->minimal_req);
 		hdrs_num(&h, "X-Kache-Count", (i64)n);
 		hdrs_num(&h, "X-Kache-Deleted", (i64)found);
 		hdrs_end(&h, 0, ka);
@@ -714,7 +752,7 @@ do_mget(Ctx *c, const Req *r, Buf *out, int ka, int del)
 	}
 	st_add(&c->st->hits, found);
 	st_add(&c->st->misses, n - found);
-	hdrs_start(&h, 200, clk_date());
+	hdrs_start(&h, 200, clk_date(), c->minimal_req);
 	hdrs_lit(&h, "Content-Type", CT_BIN);
 	hdrs_num(&h, "X-Kache-Count", (i64)n);
 	hdrs_num(&h, "X-Kache-Hits", (i64)found);
@@ -843,7 +881,7 @@ do_mset(Ctx *c, const Req *r, Buf *out, int ka)
 
 	/* Everything parsed, so the only way a record can fail now is the
 	 * arena refusing to make room; say which ones landed. */
-	hdrs_start(&h, stored == n ? 204 : 507, clk_date());
+	hdrs_start(&h, stored == n ? 204 : 507, clk_date(), c->minimal_req);
 	hdrs_num(&h, "X-Kache-Count", (i64)n);
 	hdrs_num(&h, "X-Kache-Stored", (i64)stored);
 	hdrs_end(&h, 0, ka);

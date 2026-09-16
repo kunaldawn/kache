@@ -1,11 +1,12 @@
-/* kache - listening sockets, worker event loops, the ticker, and the
- * startup and shutdown sequence that ties them together. */
+/* kache - listening sockets, worker event loops, and the startup and
+ * shutdown sequence that ties them together. */
 #include <stdio.h>
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -13,7 +14,6 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
-#include <time.h>
 #include <unistd.h>
 
 #include "config.h"
@@ -89,6 +89,37 @@ listen_on(const ServerCfg *cfg)
 	return fd;
 }
 
+/* Worker i takes cpu i % ncpu(), and takes it from inside the thread so
+ * its stack and its first buffers are faulted in where they will stay.
+ * Placing the loops by hand only pays when nothing else on the box wants
+ * those cpus, so it is off by default, and a kernel that refuses is not
+ * a reason not to serve.  It assumes one worker per logical cpu, so
+ * pairing it with CFG_THREADS_SMT 0 pins to logical ids, not to cores. */
+static void
+pin(const Worker *w)
+{
+	cpu_set_t set;
+	int cpu = w->id % ncpu();
+	int rc;
+
+	CPU_ZERO(&set);
+	CPU_SET(cpu, &set);
+	if ((rc = pthread_setaffinity_np(pthread_self(), sizeof(set),
+	                                 &set)) != 0) {
+		errno = rc;
+		warn("worker %d: cannot pin to cpu %d:", w->id, cpu);
+	}
+}
+
+static void
+wake(Worker *w)
+{
+	u64 one = 1;
+	ssize_t put = write(w->wfd, &one, sizeof(one));
+
+	(void)put;   /* the loop re-checks the stop flag anyway */
+}
+
 /* ---- worker ---------------------------------------------------------- */
 
 static void
@@ -136,7 +167,7 @@ worker_main(void *arg)
 	Worker *w = arg;
 	struct epoll_event evs[CFG_EVENTS];
 	struct epoll_event ev;
-	u64 last_reap = now_ms();
+	u64 last_reap = now_ms(), last_sync = last_reap;
 	char name[16];
 
 	snprintf(name, sizeof(name), "kache/%d", w->id);
@@ -148,14 +179,25 @@ worker_main(void *arg)
 	ev.data.ptr = &w->wake_tag;
 	epoll_ctl(w->epfd, EPOLL_CTL_ADD, w->wfd, &ev);
 
+	if (w->cfg->affinity)
+		pin(w);
 	while (!atomic_load_explicit(&stopping, memory_order_relaxed)) {
 		int n = epoll_wait(w->epfd, evs, CFG_EVENTS, 200);
+		int err = errno;
 		u64 now;
 		int i;
 
+		/* Whoever comes out of epoll_wait refreshes the clock, so
+		 * no thread exists to do only that.  Under load it is
+		 * fresher than a millisecond timer would manage, and idle
+		 * it trails by at most one timeout, which nobody can
+		 * observe because nobody is asking.  errno is saved first
+		 * because clk_read_ms may clobber it on its fallback. */
+		clk_update();
 		if (n < 0) {
-			if (errno == EINTR)
+			if (err == EINTR)
 				continue;
+			errno = err;
 			warn("epoll_wait:");
 			break;
 		}
@@ -182,63 +224,56 @@ worker_main(void *arg)
 			reap_idle(w, now);
 			last_reap = now;
 		}
-	}
-	return NULL;
-}
-
-/* ---- background ticker ------------------------------------------------ */
-
-static void *
-ticker_main(void *arg)
-{
-	Db *db = arg;
-	u64 last_sync = now_ms();
-	const ServerCfg *cfg = workers[0].cfg;
-
-	pthread_setname_np(pthread_self(), "kache/tick");
-	while (!atomic_load_explicit(&stopping, memory_order_relaxed)) {
-		struct timespec ts = {
-			.tv_sec = 0,
-			.tv_nsec = (long)CFG_TICK_MS * 1000000L
-		};
-
-		nanosleep(&ts, NULL);
-		clk_update();
-		if (cfg->sync_ms) {
-			u64 now = now_ms();
-
-			if (now - last_sync >= cfg->sync_ms) {
-				db_sync(db, 0);
-				last_sync = now;
-			}
+		/* One worker carries the periodic flush for all of them.
+		 * It gets its own deadline rather than riding the reap
+		 * tick above, which would quietly round -y up to a
+		 * second; MS_ASYNC only queues the writeback, so the
+		 * pause it costs this loop is short. */
+		if (w->id == 0 && w->cfg->sync_ms &&
+		    now - last_sync >= w->cfg->sync_ms) {
+			db_sync(w->ctx.db, 0);
+			last_sync = now;
 		}
+	}
+	/* A worker only leaves that loop on a shutdown or on an epoll it
+	 * cannot use again.  In the second case the others would carry on
+	 * serving with one listener unattended and, if this was worker 0,
+	 * with nothing flushing the store, so take the whole server down
+	 * rather than half of it. */
+	if (!atomic_load_explicit(&stopping, memory_order_relaxed)) {
+		unsigned i;
+
+		warn("worker %d stopped; shutting down", w->id);
+		atomic_store_explicit(&stopping, 1, memory_order_relaxed);
+		for (i = 0; i < nworkers; i++)
+			wake(&workers[i]);
 	}
 	return NULL;
 }
 
 /* ---- lifecycle -------------------------------------------------------- */
 
-static void
-wake(Worker *w)
-{
-	u64 one = 1;
-	ssize_t put = write(w->wfd, &one, sizeof(one));
-
-	(void)put;   /* the loop re-checks the stop flag anyway */
-}
-
 int
 server_run(Db *db, const ServerCfg *cfg)
 {
-	pthread_t ticker;
 	sigset_t set;
 	unsigned i, started = 0;
 	u64 began = now_ms();
 	int sig, rc = 0;
 
-	nworkers = cfg->threads ? cfg->threads : (unsigned)ncpu();
+	/* This loop is memory bound, so a second worker on a core's
+	 * sibling can be worth less than the cache lines it evicts;
+	 * CFG_THREADS_SMT 0 asks for one worker per physical core. */
+	nworkers = cfg->threads ? cfg->threads :
+	           (unsigned)(CFG_THREADS_SMT ? ncpu() : ncores());
 	workers = ecalloc(nworkers, sizeof(Worker));
 	stats_init(nworkers);
+
+	/* Every worker's descriptors have to read as unset before the
+	 * first goto: the cleanup at out: walks all of them, not only
+	 * the ones the setup loop below reached. */
+	for (i = 0; i < nworkers; i++)
+		workers[i].epfd = workers[i].lfd = workers[i].wfd = -1;
 
 	signal(SIGPIPE, SIG_IGN);
 	sigemptyset(&set);
@@ -258,10 +293,8 @@ server_run(Db *db, const ServerCfg *cfg)
 		w->ctx.default_ttl = cfg->default_ttl;
 		w->ctx.started = began;
 		w->ctx.allow_flush = cfg->allow_flush;
+		w->ctx.minimal = cfg->minimal;
 		w->ctx.max_req = (size_t)db->map.maxval + CFG_REQ_SLACK;
-		w->epfd = -1;
-		w->lfd = -1;
-		w->wfd = -1;
 
 		if ((w->lfd = listen_on(cfg)) < 0)
 			goto fail;
@@ -283,10 +316,6 @@ server_run(Db *db, const ServerCfg *cfg)
 		}
 		started++;
 	}
-	if (pthread_create(&ticker, NULL, ticker_main, db) != 0) {
-		warn("cannot start the ticker");
-		goto fail;
-	}
 
 	info("listening on %s port %s with %u threads", cfg->addr, cfg->port,
 	     nworkers);
@@ -299,7 +328,6 @@ server_run(Db *db, const ServerCfg *cfg)
 		wake(&workers[i]);
 	for (i = 0; i < started; i++)
 		pthread_join(workers[i].th, NULL);
-	pthread_join(ticker, NULL);
 	goto out;
 
 fail:

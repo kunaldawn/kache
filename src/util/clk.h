@@ -1,9 +1,10 @@
 /* kache - coarse clock
  *
  * Expiry only needs millisecond resolution, so the hot paths read a
- * cached timestamp instead of entering the vDSO on every request.  A
- * single ticker thread refreshes it, and also the preformatted HTTP
- * Date header. */
+ * cached timestamp instead of entering the vDSO on every request.
+ * Every worker refreshes it once around its event loop, so the cache
+ * trails the real clock by at most one epoll timeout even when no
+ * request arrives at all, and by nothing worth measuring under load. */
 #ifndef KACHE_CLK_H
 #define KACHE_CLK_H
 
@@ -30,8 +31,8 @@ now_sec(void)
 }
 
 u64  clk_read_ms(void);           /* uncached */
-void clk_init(void);
-void clk_update(void);            /* refresh cache, called by the ticker */
+void clk_init(void);              /* once, before any worker starts */
+void clk_update(void);            /* refresh cache; any thread, any time */
 const char *clk_date(void);       /* CLK_DATE_LEN bytes, not terminated */
 
 #endif /* KACHE_CLK_H */

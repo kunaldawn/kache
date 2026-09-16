@@ -133,7 +133,13 @@ say() { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"; }
 	echo "# kache benchmark result"
 	echo "meta.tag $TAG"
 	echo "meta.date $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-	echo "meta.commit $(git rev-parse --short HEAD 2>/dev/null || echo none)"
+	# a run against uncommitted work measures something no revision
+	# names, and a result file that hides that is worse than no result
+	echo "meta.commit $(rev=$(git rev-parse --short HEAD 2>/dev/null) &&
+	                    [ -n "$rev" ] && {
+	                        git diff --quiet 2>/dev/null || rev="$rev-dirty"
+	                        echo "$rev"
+	                    } || echo none)"
 	echo "meta.host $(uname -n)"
 	echo "meta.kernel $(uname -sr)"
 	echo "meta.cpu $(sed -n 's/^model name[ \t]*: //p' /proc/cpuinfo |
