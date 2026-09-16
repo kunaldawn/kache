@@ -1,0 +1,39 @@
+# build products
+*.o
+*.d
+*.a
+/kache
+/kache-bench
+/kache-micro
+/kache-cmp
+
+# generated from config.def.h, yours to edit, not to commit
+config.h
+
+# store files and anything the tests leave behind
+*.db
+/test/tmp/
+
+# benchmark results only mean something on the machine that produced them
+/bench/
+
+# tooling
+compile_commands.json
+.cache/
+tags
+TAGS
+cscope.*
+
+# crash and profile output
+core
+core.*
+*.core
+vgcore.*
+perf.data
+perf.data.old
+
+# editors
+*.swp
+*~
+.vscode/
+.idea/

@@ -1,0 +1,191 @@
+.Dd September 16, 2026
+.Dt KACHE 1
+.Os
+.Sh NAME
+.Nm kache
+.Nd multi threaded, file backed key/value cache with an HTTP interface
+.Sh SYNOPSIS
+.Nm
+.Op Fl mPHnFqvh
+.Op Fl l Ar addr
+.Op Fl p Ar port
+.Op Fl f Ar file
+.Op Fl s Ar size
+.Op Fl S Ar shards
+.Op Fl t Ar threads
+.Op Fl c Ar conns
+.Op Fl e Ar ttl
+.Op Fl y Ar ms
+.Op Fl i Ar idle
+.Op Fl b Ar backlog
+.Op Fl B Ar bytes
+.Op Fl K Ar bytes
+.Op Fl V Ar bytes
+.Sh DESCRIPTION
+.Nm
+keeps a key/value cache in a file mapped
+.Dv MAP_SHARED ,
+so the data lives in the page cache while it is hot and survives a
+restart without a serialisation step.  Entries carry an optional time to
+live and a version used for compare and swap.  Clients speak HTTP/1.1.
+.Pp
+The store is divided into independently locked shards, each with its own
+hash index and allocation arena.  When a shard runs out of room it evicts
+approximately least recently used entries, preferring ones that have
+already expired.
+.Pp
+The options are as follows:
+.Bl -tag -width Ds
+.It Fl l Ar addr
+Address to listen on.  Default
+.Ql 0.0.0.0 .
+.It Fl p Ar port
+Port to listen on.  Default
+.Ql 7070 .
+.It Fl f Ar file
+Backing file.  Created if absent.  Default
+.Ql kache.db .
+.It Fl s Ar size
+Size of the backing file, with an optional
+.Ql k , m , g
+or
+.Ql t
+suffix.  This is roughly how much the cache holds.  Default
+.Ql 1G .
+.It Fl S Ar shards
+Number of shards, rounded down to a power of two.  Zero derives one from
+the file size.  Default zero.
+.It Fl t Ar threads
+Worker threads.  Zero means one per CPU.  Default zero.
+.It Fl c Ar conns
+Maximum concurrent connections per thread.  Default
+.Ql 8192 .
+.It Fl e Ar ttl
+Time to live in seconds applied to requests that do not carry one.  Zero
+means entries do not expire by default.  Default zero.
+.It Fl y Ar ms
+How often to
+.Xr msync 2
+the mapping in the background.  Zero leaves writeback entirely to the
+kernel.  Default
+.Ql 1000 .
+.It Fl i Ar idle
+Seconds a connection may sit idle before it is closed.  Default
+.Ql 60 .
+.It Fl b Ar backlog
+Listen backlog.  Default
+.Ql 1024 .
+.It Fl B Ar bytes
+Expected size of a stored item, header and key included.  Enough buckets
+are provisioned that an arena full of items this size can still be
+indexed at the table's load factor, so it decides the split between index
+and data and nothing else.  Default
+.Ql 128 .
+.It Fl K Ar bytes
+Largest key accepted.  Default
+.Ql 255 .
+.It Fl V Ar bytes
+Largest value accepted.  Also bounds how many shards fit, since a shard's
+arena must hold several maximum sized items.  Default
+.Ql 256k .
+.It Fl m
+Lock the mapping into memory with
+.Xr mlock 2
+so it can never be paged out.  Needs a sufficient
+.Dv RLIMIT_MEMLOCK .
+.It Fl P
+Fault the whole file in at startup instead of on demand.
+.It Fl H
+Advise the kernel that the mapping may use transparent huge pages.
+.It Fl n
+Discard any existing contents and create the store afresh.  Required to
+change the geometry of an existing file.
+.It Fl F
+Enable
+.Ql POST /flush .
+Without it that endpoint answers 403.
+.It Fl q
+Quiet; suppress informational messages.
+.It Fl v
+Print the version and exit.
+.It Fl h
+Print a usage summary and exit.
+.El
+.Sh HTTP INTERFACE
+.Bl -tag -width "POST /prepend/<key>" -compact
+.It Cm GET Ar /kv/<key>
+Fetch.  The
+.Ql ETag
+is the compare and swap token.
+.It Cm HEAD Ar /kv/<key>
+Metadata only.
+.It Cm PUT Ar /kv/<key>
+Store the request body.
+.It Cm POST Ar /kv/<key>
+As
+.Cm PUT .
+.It Cm DELETE Ar /kv/<key>
+Remove.
+.It Cm POST Ar /incr/<key>
+Add
+.Ql ?by=N
+to a numeric value.
+.It Cm POST Ar /decr/<key>
+Subtract
+.Ql ?by=N .
+.It Cm POST Ar /append/<key>
+Append the body.
+.It Cm POST Ar /prepend/<key>
+Prepend the body.
+.It Cm POST Ar /touch/<key>
+Reset the time to live.
+.It Cm POST Ar /flush
+Drop everything.
+.It Cm GET Ar /stats
+Counters, one per line.
+.It Cm GET Ar /metrics
+The same in Prometheus form.
+.It Cm GET Ar /health
+Liveness.
+.El
+.Pp
+.Ql ?ttl=<seconds>
+or
+.Ql ?ttlms=<milliseconds>
+sets the expiry, zero meaning never.
+.Ql If-None-Match: *
+stores only when the key is absent and
+.Ql If-Match: \(dq<etag>\(dq
+only when the value has not changed since it was read; both answer 412
+when the condition fails.  Every operation is atomic with respect to
+every other operation on the same key.
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa config.def.h
+Compile time defaults and limits.  Copied to
+.Pa config.h
+by the build, which is the file to edit.
+.El
+.Sh EXIT STATUS
+.Ex -std
+.Sh EXAMPLES
+Serve a four gigabyte cache with a default expiry of five minutes:
+.Pp
+.Dl $ kache -f /var/tmp/kache.db -s 4G -e 300
+.Pp
+Store and read a value:
+.Pp
+.Dl $ curl -X PUT -d hello localhost:7070/kv/greeting
+.Dl $ curl localhost:7070/kv/greeting
+.Sh DIAGNOSTICS
+On startup after an unclean shutdown
+.Nm
+reports that it is rebuilding the index, and how many records survived.
+A shard whose block chain fails validation is reset and reported
+separately.
+.Sh BUGS
+Only one process may have a store file open at a time, which is enforced
+with an advisory lock.  Durability is best effort: writes reach disk when
+the kernel or
+.Fl y
+says so, and a crash can lose the most recent ones.
