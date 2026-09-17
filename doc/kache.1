@@ -357,6 +357,31 @@ it and by a once a second housekeeping tick.
 .Ql kache_reclaim_pending
 counts what is still waiting.  An allocation that cannot be met reclaims
 all of it before evicting anything a client can still read.
+.Sh SECURITY
+.Nm
+has no authentication and no transport security: anything that can open a
+connection can read and write every key.
+.Fl F
+gates
+.Ql POST /flush
+because it cannot be undone, but every other write is already unguarded.
+.Pp
+On a node started with
+.Fl C
+the endpoint
+.Ql POST /x/repl
+applies a peer's writes directly, without the ownership check that
+answers a client with a 307.  Nothing identifies the sender, so a request
+to it from anywhere else is indistinguishable from one from a peer, and
+anything that can reach the port can therefore write any key on every
+node of the cluster.  Bind the port where only the peers and your own
+clients can reach it
+.Pq Fl l ,
+or firewall it.  Where clients cannot reach the nodes on the address the
+peers use, see
+.Fl U
+and
+.Xr kache-lb 1 .
 .Sh FILES
 .Bl -tag -width Ds
 .It Pa config.def.h

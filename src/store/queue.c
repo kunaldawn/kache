@@ -189,7 +189,14 @@ q_trim(Map *m, Shard *s, Rec *r, u64 maxlen, int right)
 	QHdr *q = q_hdr(r);
 	u64 n = 0;
 
-	while (q->count > maxlen) {
+	/* The count and the segment chain agree for every queue this code
+	 * builds, and recovery recomputes the count from the chain when it
+	 * cannot be sure.  A store that was closed cleanly is trusted as it
+	 * stands, though, so a file damaged underneath us would arrive here
+	 * with a count and no segments to take it from - and q_take on an
+	 * empty queue is a pointer built from a null reference.  Trusting
+	 * the chain over the counter costs one predicted branch. */
+	while (q->count > maxlen && q->head) {
 		q_take(m, s, r, right);
 		n++;
 	}

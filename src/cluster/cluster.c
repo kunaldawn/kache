@@ -1,8 +1,10 @@
 /* kache - replication across nodes.  See cluster.h for the design. */
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -54,6 +56,9 @@ struct Cluster {
 	int      cur;
 
 	pthread_t th;
+	u8      *val;         /* the flusher's scratch value buffer, one
+	                       * allocation for the life of the process
+	                       * rather than one per flush window */
 	_Atomic int stopping;
 
 	_Atomic u64 sent, recvd, failed;
@@ -66,6 +71,10 @@ struct Cluster {
  * key that is being overwritten faster than it can be shipped costs a
  * staleness window, which is what the caller already accepted. */
 #define CL_DIRTY_SLOTS 4096u
+
+/* Frame buffer kept between flushes; anything above it is a spike and is
+ * handed back rather than held for the life of the process. */
+#define CL_BODY_KEEP (1u << 20)
 
 /* ---- membership ------------------------------------------------------ */
 
@@ -279,6 +288,49 @@ frame(Buf *b, int op, const void *k, u32 kl, const void *v, u32 vl,
 		buf_put(b, v, vl);
 }
 
+/* One space separated field of a frame header, bounded by the line it
+ * sits on.  The bound is the whole point: these bytes arrive off a
+ * socket and carry no terminator, so a parser that scans for one reads
+ * past the request. */
+static int
+wire_field(const char **p, const char *end, const char **f, size_t *fn)
+{
+	const char *s = *p, *sp;
+
+	while (s < end && *s == ' ')
+		s++;
+	if (s == end)
+		return -1;
+	for (sp = s; sp < end && *sp != ' '; sp++)
+		;
+	*f = s;
+	*fn = (size_t)(sp - s);
+	*p = sp;
+	return 0;
+}
+
+static int
+wire_u64(const char **p, const char *end, u64 *out)
+{
+	const char *f;
+	size_t fn;
+
+	if (wire_field(p, end, &f, &fn) < 0)
+		return -1;
+	return parse_u64(f, fn, out);
+}
+
+static int
+wire_i64(const char **p, const char *end, i64 *out)
+{
+	const char *f;
+	size_t fn;
+
+	if (wire_field(p, end, &f, &fn) < 0)
+		return -1;
+	return parse_i64(f, fn, out);
+}
+
 int
 cl_apply(Cluster *c, const void *body, size_t n, u32 *applied)
 {
@@ -286,23 +338,42 @@ cl_apply(Cluster *c, const void *body, size_t n, u32 *applied)
 
 	*applied = 0;
 	while (p < end) {
-		unsigned long long kl, vl, flags, version;
-		long long ttl;
 		const char *nl = memchr(p, '\n', (size_t)(end - p));
+		const char *line, *f;
+		u64 kl, vl, flags, version;
+		size_t fn;
+		i64 ttl;
 		DbMeta m;
 		char op;
 		int rc;
 
 		if (!nl)
 			return -1;
-		if (sscanf(p, "%c %llu %llu %lld %llu %llu",
-		           &op, &kl, &vl, &ttl, &flags, &version) != 6)
+		/* Every field is read inside this one line, and every length
+		 * is checked against what is really left of the body.  The
+		 * frame header is the only part of kache a peer writes and
+		 * this node parses, so it is the only place where being
+		 * strict costs nothing and being loose costs everything. */
+		line = p;
+		if (wire_field(&line, nl, &f, &fn) < 0 || fn != 1)
 			return -1;
+		op = *f;
 		if (op != 'S' && op != 'D')
 			return -1;
+		if (wire_u64(&line, nl, &kl) < 0 ||
+		    wire_u64(&line, nl, &vl) < 0 ||
+		    wire_i64(&line, nl, &ttl) < 0 ||
+		    wire_u64(&line, nl, &flags) < 0 ||
+		    wire_u64(&line, nl, &version) < 0)
+			return -1;
+		/* nothing but spaces may follow the last field */
+		if (wire_field(&line, nl, &f, &fn) == 0)
+			return -1;
+
 		p = nl + 1;
 		if (kl == 0 || kl > CFG_MAX_KEY || vl > c->db->map.maxval ||
-		    (unsigned long long)(end - p) < kl + vl)
+		    flags > 0xffffffffull ||
+		    (u64)(end - p) < kl + vl)
 			return -1;
 		/* The owner's version rides the wire because it is the first
 		 * thing wanted when a cluster is disagreeing, but it is not
@@ -340,6 +411,59 @@ cl_apply(Cluster *c, const void *body, size_t n, u32 *applied)
 
 /* ---- the peer connection --------------------------------------------- */
 
+/* Every peer operation is bounded in time, because all of them happen on
+ * the one flusher thread.  A peer that accepts a connection and then says
+ * nothing - a machine being fenced, a dropped route, a box that is
+ * swapping - would otherwise park the thread in the kernel and stop this
+ * node replicating to the peers that are still healthy.  A timeout turns
+ * that into one missed window against one peer. */
+#define CL_IO_MS 2000
+
+static void
+peer_deadline(int fd)
+{
+	struct timeval tv;
+
+	tv.tv_sec = CL_IO_MS / 1000;
+	tv.tv_usec = (CL_IO_MS % 1000) * 1000;
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+}
+
+/* A blocking connect() to an address that black holes packets takes the
+ * kernel's SYN retry budget to fail - over two minutes - and the flusher
+ * has nothing else to do meanwhile.  So the socket is non blocking for
+ * the connect alone and waited on with our own deadline, then put back. */
+static int
+connect_wait(int fd, const struct sockaddr *sa, socklen_t salen)
+{
+	struct pollfd pfd;
+	int flags, err = 0;
+	socklen_t el = sizeof(err);
+
+	if ((flags = fcntl(fd, F_GETFL, 0)) < 0)
+		return -1;
+	if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
+		return -1;
+	if (connect(fd, sa, salen) < 0) {
+		if (errno != EINPROGRESS)
+			return -1;
+		pfd.fd = fd;
+		pfd.events = POLLOUT;
+		for (;;) {
+			int rc = poll(&pfd, 1, CL_IO_MS);
+
+			if (rc > 0)
+				break;
+			if (rc == 0 || errno != EINTR)
+				return -1;
+		}
+		if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) < 0 || err)
+			return -1;
+	}
+	return fcntl(fd, F_SETFL, flags);
+}
+
 static int
 peer_connect(Node *n)
 {
@@ -356,33 +480,45 @@ peer_connect(Node *n)
 		            ai->ai_protocol);
 		if (fd < 0)
 			continue;
-		if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0)
+		if (connect_wait(fd, ai->ai_addr, ai->ai_addrlen) == 0)
 			break;
 		close(fd);
 		fd = -1;
 	}
 	freeaddrinfo(res);
-	if (fd >= 0)
+	if (fd >= 0) {
 		setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
+		peer_deadline(fd);
+	}
 	n->fd = fd;
 	return fd;
 }
 
+/* The request line and the frames go out together.  Two write() calls
+ * are two syscalls and, with TCP_NODELAY set, usually two segments on
+ * the wire for what is one message - so a flush of a handful of small
+ * keys costs twice the packets it needs to.  One writev is one of
+ * each. */
 static int
-write_all(int fd, const void *p, size_t n)
+writev_all(int fd, struct iovec *v, int n)
 {
-	const u8 *b = p;
-
 	while (n) {
-		ssize_t w = write(fd, b, n);
+		ssize_t w = writev(fd, v, n);
 
 		if (w < 0) {
 			if (errno == EINTR)
 				continue;
 			return -1;
 		}
-		b += w;
-		n -= (size_t)w;
+		while (n && (size_t)w >= v->iov_len) {
+			w -= (ssize_t)v->iov_len;
+			v++;
+			n--;
+		}
+		if (n && w) {
+			v->iov_base = (char *)v->iov_base + w;
+			v->iov_len -= (size_t)w;
+		}
 	}
 	return 0;
 }
@@ -420,6 +556,7 @@ static void
 peer_send(Cluster *c, Node *n, const Buf *body)
 {
 	char head[512];
+	struct iovec v[2];
 	int len, code;
 
 	if (n->fd < 0 && peer_connect(n) < 0) {
@@ -436,8 +573,11 @@ peer_send(Cluster *c, Node *n, const Buf *body)
 	 * the ordering argument in cl_apply true.  A failure closes it so
 	 * the next flush reconnects rather than resuming a stream whose
 	 * position nobody knows. */
-	if (write_all(n->fd, head, (size_t)len) < 0 ||
-	    write_all(n->fd, body->p, body->len) < 0 ||
+	v[0].iov_base = head;
+	v[0].iov_len = (size_t)len;
+	v[1].iov_base = body->p;
+	v[1].iov_len = body->len;
+	if (writev_all(n->fd, v, 2) < 0 ||
 	    (code = read_status(n->fd)) < 0 || code >= 400) {
 		close(n->fd);
 		n->fd = -1;
@@ -469,12 +609,11 @@ static void
 flush(Cluster *c, Buf *body)
 {
 	Dirty *d = swap_sets(c);
-	u8 *val = NULL;
+	u8 *val = c->val;
 	u32 i, nsent = 0;
 
 	if (!d->n)
 		return;
-	val = emalloc(c->db->map.maxval);
 	body->len = body->off = 0;
 	for (i = 0; i < CL_DIRTY_SLOTS; i++) {
 		DbMeta m;
@@ -513,7 +652,13 @@ flush(Cluster *c, Buf *body)
 		    atomic_load_explicit(&c->sent, memory_order_relaxed) + nsent,
 		    memory_order_relaxed);
 	}
-	free(val);
+	/* One window that happened to carry large values would otherwise
+	 * leave the frame buffer that size for the life of the process, and
+	 * the flusher never shrinks on its own.  Keeping the common case
+	 * allocated and giving back the spike is the same trade the
+	 * connection buffers make. */
+	if (body->cap > CL_BODY_KEEP)
+		buf_free(body);
 }
 
 static void *
@@ -576,10 +721,12 @@ cl_open(Cluster **out, Db *db, const ClusterCfg *cfg)
 	}
 	dirty_init(&c->set[0]);
 	dirty_init(&c->set[1]);
+	c->val = emalloc(db->map.maxval);
 	if (pthread_create(&c->th, NULL, flusher, c) != 0) {
 		warn("cluster: cannot start the flusher");
 		dirty_fini(&c->set[0]);
 		dirty_fini(&c->set[1]);
+		free(c->val);
 		free(c);
 		return -1;
 	}
@@ -604,5 +751,6 @@ cl_close(Cluster *c)
 			close(c->node[i].fd);
 	dirty_fini(&c->set[0]);
 	dirty_fini(&c->set[1]);
+	free(c->val);
 	free(c);
 }

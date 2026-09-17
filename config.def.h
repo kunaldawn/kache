@@ -96,7 +96,9 @@
  * The price is staleness bounded by CFG_HOT_MS: a write is invisible to
  * the other workers for that long.  The worker that takes the write
  * drops its own set at once, so a client on one connection still reads
- * its own writes.  0 disables all of it. */
+ * its own writes.  An entry never outlives the item's own ttl, whichever
+ * of the two is shorter, because an expiry is a promise and staleness is
+ * only a trade.  0 disables all of it. */
 #define CFG_HOT_MS           0u
 /* responses kept per worker, a power of two; direct mapped by hash */
 #define CFG_HOT_SLOTS        16u

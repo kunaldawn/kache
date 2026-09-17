@@ -26,7 +26,9 @@ typedef struct Buf {
 } Buf;
 
 void buf_free(Buf *b);
-/* make room for n more bytes; -1 if that would pass max (0 = no limit) */
+/* Make room for n more bytes.  0 when there is now room for all n; -1
+ * when max (0 = no limit) stopped it short, in which case the buffer may
+ * still have grown and buf_room() says by how much. */
 int  buf_grow(Buf *b, size_t n, size_t max);
 /* consume n bytes from the front */
 void buf_drain(Buf *b, size_t n);

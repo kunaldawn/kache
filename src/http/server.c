@@ -35,11 +35,21 @@ typedef struct Worker {
 	int       epfd;
 	int       lfd;
 	int       wfd;
+	u64       lresume;      /* ms at which a paused listener is re-armed */
 	Pool      pool;
 	Ctx       ctx;
 	pthread_t th;
 	const ServerCfg *cfg;
 } Worker;
+
+/* How long the listener stays out of the epoll set after the process has
+ * run out of descriptors.  Level triggered interest means a listener with
+ * a pending connection it cannot accept reports readable on every pass,
+ * so without this the worker spins on accept4 at a hundred percent of a
+ * core for as long as the shortage lasts - exactly when the machine can
+ * least afford it.  Long enough that the spin is gone, short enough that
+ * recovery is not noticeable. */
+#define ACCEPT_PAUSE_MS 100u
 
 static _Atomic int stopping;
 static Worker *workers;
@@ -122,6 +132,17 @@ wake(Worker *w)
 
 /* ---- worker ---------------------------------------------------------- */
 
+/* Take the listener out of, or put it back into, this worker's epoll. */
+static void
+listen_arm(Worker *w, int on)
+{
+	struct epoll_event ev;
+
+	ev.events = on ? EPOLLIN : 0;
+	ev.data.ptr = &w->listen_tag;
+	epoll_ctl(w->epfd, EPOLL_CTL_MOD, w->lfd, &ev);
+}
+
 static void
 do_accept(Worker *w, u64 now)
 {
@@ -135,6 +156,16 @@ do_accept(Worker *w, u64 now)
 		if (fd < 0) {
 			if (errno == EINTR)
 				continue;
+			/* Out of descriptors or out of memory: the pending
+			 * connection stays pending and the listener stays
+			 * readable, so coming straight back is a busy loop.
+			 * Stand down briefly instead. */
+			if (errno == EMFILE || errno == ENFILE ||
+			    errno == ENOBUFS || errno == ENOMEM) {
+				st_inc(&w->ctx.st->errors);
+				listen_arm(w, 0);
+				w->lresume = now + ACCEPT_PAUSE_MS;
+			}
 			return;       /* EAGAIN, or a transient failure */
 		}
 		setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
@@ -219,6 +250,10 @@ worker_main(void *arg)
 				if (conn_event(c, &w->ctx, evs[i].events) < 0)
 					conn_close(&w->pool, c, w->ctx.st);
 			}
+		}
+		if (UNLIKELY(w->lresume) && now >= w->lresume) {
+			w->lresume = 0;
+			listen_arm(w, 1);
 		}
 		if (now - last_reap >= 1000) {
 			reap_idle(w, now);

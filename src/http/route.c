@@ -360,7 +360,7 @@ do_get(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
 		    (doff = hot_date_off(out->p + mark, rlen)) >= 0 &&
 		    hot_admit(c->hot, hash, now)) {
 			hot_fill(c->hot, hash, k->c, k->n, out->p + mark,
-			         rlen, (u32)doff, now);
+			         rlen, (u32)doff, now, m.ttl);
 			st_inc(&c->st->hot_fills);
 		}
 	}
@@ -1003,15 +1003,18 @@ batch_field(Str *rest, Str *field)
 static void
 do_mget(Ctx *c, const Req *r, Buf *out, int ka, int del)
 {
-	/* /mdel comes through here too, and that one writes. */
-	if (del && c->hot)
-		hot_dirty(c->hot);
-	size_t mark = out->len;
+	size_t mark;
 	const char *p = r->body.p, *end = r->body.p + r->body.n;
 	Hdrs h;
 	Str line;
 	Key k;
 	u32 n = 0, found = 0;
+	int full = 0;
+
+	/* /mdel comes through here too, and that one writes. */
+	if (del && c->hot)
+		hot_dirty(c->hot);
+	mark = out->len;
 
 	while (batch_line(&p, end, &line)) {
 		DbMeta m;
@@ -1035,6 +1038,19 @@ do_mget(Ctx *c, const Req *r, Buf *out, int ka, int del)
 			if (db_del(c->db, k.c, k.n, 0, 0) == DB_OK)
 				found++;
 			continue;
+		}
+		/* A batch names keys but is answered with values, so the body
+		 * a few hundred bytes of key names buy is bounded by nothing
+		 * but the store: a thousand keys of the largest size is a
+		 * quarter of a gigabyte of response buffered per connection,
+		 * from a request that cost the client almost nothing to send.
+		 * The container dumps already stop at CFG_CONT_DUMP_MAX for
+		 * the same reason; this is the same cap, and what is left is
+		 * reported the same way, so a caller can ask for the rest. */
+		if (out->len - mark >= CFG_CONT_DUMP_MAX) {
+			full = 1;
+			n--;
+			break;
 		}
 		vmark = out->len;
 		for (tries = 0; tries < 4; tries++) {
@@ -1078,6 +1094,8 @@ do_mget(Ctx *c, const Req *r, Buf *out, int ka, int del)
 	hdrs_lit(&h, "Content-Type", CT_BIN);
 	hdrs_num(&h, "X-Kache-Count", (i64)n);
 	hdrs_num(&h, "X-Kache-Hits", (i64)found);
+	if (full)
+		hdrs_lit(&h, "X-Kache-Truncated", "1");
 	hdrs_end(&h, out->len - mark, ka);
 	http_wrap(out, mark, &h);
 }

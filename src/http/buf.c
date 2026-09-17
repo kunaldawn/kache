@@ -16,25 +16,42 @@ int
 buf_grow(Buf *b, size_t n, size_t max)
 {
 	size_t want = b->len + n, cap;
+	int shorted = 0;
 
+	/* b->len + n is bounded by the request limits everywhere it is
+	 * called from, but the doubling below is what would turn an
+	 * overflow into a buffer smaller than the caller is about to write
+	 * into, so it is checked here rather than argued about there. */
+	if (want < b->len)
+		return -1;
 	if (want <= b->cap)
 		return 0;
 	if (max) {
 		if (b->len >= max)
 			return -1;
-		if (want > max)
+		if (want > max) {
 			want = max;     /* give what is left, not nothing */
-		if (want <= b->cap)
-			return 0;
+			shorted = 1;
+		}
 	}
 	cap = b->cap ? b->cap : CFG_BUF_INIT;
-	while (cap < want)
+	while (cap < want) {
+		if (cap > (size_t)-1 / 2) {
+			cap = want;
+			break;
+		}
 		cap <<= 1;
+	}
 	if (max && cap > max)
 		cap = max;
-	b->p = erealloc(b->p, cap);
-	b->cap = cap;
-	return 0;
+	if (cap > b->cap) {
+		b->p = erealloc(b->p, cap);
+		b->cap = cap;
+	}
+	/* Room was made, but less than was asked for.  Saying so is the
+	 * whole difference between a caller that checks buf_room() and one
+	 * that writes n bytes into what it was told it had. */
+	return shorted ? -1 : 0;
 }
 
 void
@@ -75,6 +92,9 @@ buf_insert(Buf *b, size_t at, const void *p, size_t n)
 {
 	size_t tail = b->len - at;
 
+	/* Nothing to splice in, and b->p may not exist yet - see buf_put. */
+	if (!n)
+		return;
 	buf_grow(b, n, 0);
 	if (tail)
 		memmove(b->p + at + n, b->p + at, tail);
@@ -85,6 +105,14 @@ buf_insert(Buf *b, size_t at, const void *p, size_t n)
 void
 buf_put(Buf *b, const void *p, size_t n)
 {
+	/* An empty value - a zero length queue message, a map field stored
+	 * with no bytes - is the one input that reaches here asking for
+	 * nothing.  buf_grow has nothing to do for it either, so the buffer
+	 * of a connection whose first response this is has no allocation
+	 * yet, and memcpy(NULL, p, 0) is undefined however little it does.
+	 * Returning early is both the correct answer and the cheaper one. */
+	if (!n)
+		return;
 	buf_grow(b, n, 0);
 	memcpy(b->p + b->len, p, n);
 	b->len += n;

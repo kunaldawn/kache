@@ -120,6 +120,11 @@ out of rotation while they fail.  Measured at **0.230 syscalls per
 request** carried, against kache's own 0.1875, because 16 KiB buffers
 coalesce a batch at least as well as the client pipelined it.
 
+A pair that has moved nothing for `-i` seconds is closed, 60 by default
+and `-i 0` turns it off.  A balancer holds a slot and a backend
+connection for every client it has accepted, so without that a client
+that connects and then says nothing costs it both for ever.
+
 One thing to know before benchmarking it: a proxy adds a hop, and at a
 fixed number of in-flight requests throughput is concurrency divided by
 round trip time.  At depth 16 over two connections it measures 0.55x a
@@ -316,6 +321,37 @@ starts over.  The knobs that matter:
     -M         drop the optional response headers; doc/API.md lists
                exactly which, and which are kept regardless
     -A         pin each worker to one cpu
+
+Security
+--------
+
+kache has no authentication and no transport security.  Everything below
+follows from that, and none of it is a substitute for putting the port
+somewhere only the callers you mean can reach it.
+
+Anyone who can open a connection can read and write every key.  `-F`
+gates `POST /flush` because dropping the whole store is the one request
+that cannot be undone, but it is a guard against a stray script, not
+against an attacker - every other write is already unguarded.
+
+`POST /x/repl` is the endpoint peers ship their writes to, and it is the
+one that matters most.  It applies writes directly, without the ownership
+check that redirects a client to the owner with a 307, because the peer
+on the other end is assumed to be the owner.  A request to it from
+anywhere else is indistinguishable from one from a peer, so on a node
+started with `-C` **anything that can reach the port can write any key on
+every node in the cluster**, and those writes propagate.  Nothing about
+the request identifies its sender.
+
+So a cluster's port is not a public port.  Bind it to an address only the
+peers and your own clients can reach (`-l`), or firewall it, or keep the
+cluster on its own network.  If clients have to reach the nodes from
+somewhere the peers do not, that is what `-U` and `kache-lb` are for: the
+balancer takes the client traffic and the nodes talk to each other
+directly.
+
+The request parser is written for untrusted input and is fuzzed as such;
+what is deliberately absent is any notion of who is asking.
 
 Building and testing
 --------------------

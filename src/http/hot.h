@@ -75,9 +75,11 @@ const HotEnt *hot_get(Hot *h, u64 hash, const void *k, u32 kl, u64 now);
 int hot_admit(Hot *h, u64 hash, u64 now);
 
 /* Keep resp as the answer for this key.  doff is where the Date value
- * begins inside it; hot_date_off finds that. */
+ * begins inside it; hot_date_off finds that.  ttl is what the store said
+ * the item has left, in ms, or DB_FOREVER style negative for none: an
+ * entry may not outlive the item it is a copy of. */
 void hot_fill(Hot *h, u64 hash, const void *k, u32 kl, const void *resp,
-              u32 rlen, u32 doff, u64 now);
+              u32 rlen, u32 doff, u64 now, i64 ttl);
 
 /* Offset of the Date header's value within a finished response, or -1 if
  * it does not carry one - in which case it must not be cached, since a

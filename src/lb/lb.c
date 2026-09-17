@@ -95,7 +95,9 @@ struct Conn {
 	 * triggered, so clearing a flag on EAGAIN is safe: if the
 	 * condition is still true epoll says so again. */
 	u8    cr, cw, br, bw;
+	u8    cshut, bshut;       /* FIN already forwarded to that side */
 	u8    open;
+	u64   atime;              /* ms of the last event on either side */
 	Conn *fnext;
 };
 
@@ -119,6 +121,23 @@ static _Atomic int stopping;
 static _Atomic u64 rr;          /* round robin cursor, shared */
 static unsigned health_ms = 1000;
 static unsigned maxconn = 4096;
+static unsigned idle_ms = 60000;
+
+/* Coarse monotonic clock, for the idle reaper alone.  Coarse because the
+ * only thing that reads it compares it against a sixty second cutoff, and
+ * monotonic because a wall clock that steps backwards would make every
+ * connection look freshly active. */
+static u64
+now_lb(void)
+{
+	struct timespec ts;
+
+#ifdef CLOCK_MONOTONIC_COARSE
+	if (clock_gettime(CLOCK_MONOTONIC_COARSE, &ts) != 0)
+#endif
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (u64)ts.tv_sec * 1000ull + (u64)ts.tv_nsec / 1000000ull;
+}
 
 /* ---- backends -------------------------------------------------------- */
 
@@ -165,8 +184,19 @@ add_backend(const char *spec)
 		return -1;
 	}
 	n = (size_t)(colon - b->addr);
+	/* addr is the larger buffer of the two, so a long enough spec makes
+	 * the host part longer than the field it is copied into.  The host
+	 * has to be checked against its own size, not against addr's. */
+	if (!n || n >= sizeof(b->host)) {
+		warn("%s: host part is too long", spec);
+		return -1;
+	}
 	memcpy(b->host, b->addr, n);
 	b->host[n] = '\0';
+	if (strlen(colon + 1) >= sizeof(b->port)) {
+		warn("%s: port is too long", spec);
+		return -1;
+	}
 	snprintf(b->port, sizeof(b->port), "%s", colon + 1);
 
 	if (resolve(b) < 0) {
@@ -227,10 +257,26 @@ probe(Backend *b)
 	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 	if (connect(fd, (struct sockaddr *)&b->sa, b->salen) == 0 &&
-	    write(fd, req, sizeof(req) - 1) == (ssize_t)(sizeof(req) - 1) &&
-	    (got = read(fd, buf, sizeof(buf) - 1)) > 12) {
-		buf[got] = '\0';
-		ok = !memcmp(buf, "HTTP/1.", 7) && atoi(buf + 9) == 200;
+	    write(fd, req, sizeof(req) - 1) == (ssize_t)(sizeof(req) - 1)) {
+		size_t n = 0;
+
+		/* Read until the status line is whole.  A single read is not
+		 * it: TCP is free to hand back the first few bytes on their
+		 * own, and taking that as a failed check would drop a
+		 * perfectly healthy backend out of rotation. */
+		while (n < 13) {
+			got = read(fd, buf + n, sizeof(buf) - 1 - n);
+			if (got <= 0) {
+				if (got < 0 && errno == EINTR)
+					continue;
+				break;
+			}
+			n += (size_t)got;
+		}
+		if (n >= 13) {
+			buf[n] = '\0';
+			ok = !memcmp(buf, "HTTP/1.", 7) && atoi(buf + 9) == 200;
+		}
 	}
 	close(fd);
 	return ok;
@@ -462,14 +508,23 @@ pump(Worker *w, Conn *c)
 
 		/* A FIN from one side is forwarded once everything it had
 		 * already sent has been handed on, so a client that closes
-		 * after its last request still gets the answer to it. */
+		 * after its last request still gets the answer to it.  Once
+		 * only: the condition stays true for the rest of the pair's
+		 * life, so without the flag every later pass through here
+		 * repeats a shutdown the kernel has already done. */
 		if (c->ceof && c->c2b_len == c->c2b_off) {
-			shutdown(c->bfd, SHUT_WR);
+			if (!c->bshut) {
+				shutdown(c->bfd, SHUT_WR);
+				c->bshut = 1;
+			}
 			if (c->beof && c->b2c_len == c->b2c_off)
 				return -1;
 		}
 		if (c->beof && c->b2c_len == c->b2c_off) {
-			shutdown(c->cfd, SHUT_WR);
+			if (!c->cshut) {
+				shutdown(c->cfd, SHUT_WR);
+				c->cshut = 1;
+			}
 			if (c->ceof && c->c2b_len == c->c2b_off)
 				return -1;
 		}
@@ -535,9 +590,11 @@ do_accept(Worker *w)
 		c->cev = c->bev = 0;
 		c->c2b_len = c->c2b_off = c->b2c_len = c->b2c_off = 0;
 		c->ceof = c->beof = 0;
+		c->cshut = c->bshut = 0;
 		c->cr = c->cw = c->br = c->bw = 0;
 		c->connecting = 1;
 		c->open = 1;
+		c->atime = now_lb();   /* accept path; no batch clock here */
 		/* Buffers are kept on the slot once allocated: a balancer
 		 * churns connections, and freeing 32 KiB to allocate it
 		 * again a moment later is work with nothing to show. */
@@ -567,12 +624,36 @@ do_accept(Worker *w)
 	}
 }
 
+/* A pair that has moved nothing for idle_ms is closed.  Without this a
+ * client that connects and then says nothing holds a slot and a backend
+ * connection for ever, so maxconn connections opened and abandoned take
+ * the balancer out of service while costing the other end nothing - and
+ * the backend has its own idle timeout, so kache would already have let
+ * such a connection go.  The slots are a flat array and the sweep runs
+ * once a second, so this needs no ordering structure, and the event path
+ * pays one store of a number the loop had already read. */
+static void
+reap_idle(Worker *w, u64 now)
+{
+	u32 i;
+
+	if (!idle_ms || now < idle_ms)
+		return;
+	for (i = 0; i < w->cap; i++) {
+		Conn *c = &w->slots[i];
+
+		if (c->open && now - c->atime >= idle_ms)
+			conn_close(w, c);
+	}
+}
+
 static void *
 worker_main(void *arg)
 {
 	Worker *w = arg;
 	struct epoll_event evs[LB_EVENTS];
 	struct epoll_event ev;
+	u64 last_reap = now_lb();
 	char name[16];
 
 	snprintf(name, sizeof(name), "kache-lb/%d", w->id);
@@ -586,6 +667,7 @@ worker_main(void *arg)
 
 	while (!atomic_load_explicit(&stopping, memory_order_relaxed)) {
 		int n = epoll_wait(w->epfd, evs, LB_EVENTS, 200);
+		u64 now;
 		int i;
 
 		if (n < 0) {
@@ -594,6 +676,11 @@ worker_main(void *arg)
 			warn("epoll_wait:");
 			break;
 		}
+		/* Once per batch.  A pair only moves bytes as a result of an
+		 * event on it, so stamping here is the same information a
+		 * stamp per transfer would carry, for one clock read instead
+		 * of one per byte moved. */
+		now = now_lb();
 		for (i = 0; i < n; i++) {
 			Side *s = evs[i].data.ptr;
 			Conn *c;
@@ -626,6 +713,7 @@ worker_main(void *arg)
 					c->bw = 1;
 			}
 
+			c->atime = now;
 			if (c->connecting) {
 				int err = 0;
 				socklen_t el = sizeof(err);
@@ -651,6 +739,10 @@ worker_main(void *arg)
 				continue;
 			}
 			update(w, c);
+		}
+		if (now - last_reap >= 1000) {
+			reap_idle(w, now);
+			last_reap = now;
 		}
 	}
 	return NULL;
@@ -704,7 +796,7 @@ listen_on(const char *addr, const char *port, int backlog)
 
 static const char usage_text[] =
 "usage: kache-lb [-qvh] [-l addr] [-p port] [-b backends] [-t threads]\n"
-"                [-c conns] [-k ms] [-B backlog]\n"
+"                [-c conns] [-k ms] [-i idle] [-B backlog]\n"
 "\n"
 "  -l addr    address to listen on          (default 0.0.0.0)\n"
 "  -p port    port to listen on             (default 7080)\n"
@@ -712,6 +804,7 @@ static const char usage_text[] =
 "  -t n       worker threads, 0 = one/cpu   (default 0)\n"
 "  -c n       connections per thread        (default 4096)\n"
 "  -k ms      health check interval         (default 1000)\n"
+"  -i sec     idle timeout, 0 = off         (default 60)\n"
 "  -B n       listen backlog                (default 1024)\n"
 "  -q         quiet\n"
 "  -v         print version and exit\n"
@@ -745,7 +838,7 @@ main(int argc, char *argv[])
 	sigset_t set;
 	int sig;
 
-	while ((opt = getopt(argc, argv, "l:p:b:t:c:k:B:qvh")) != -1) {
+	while ((opt = getopt(argc, argv, "l:p:b:t:c:k:i:B:qvh")) != -1) {
 		switch (opt) {
 		case 'l': addr = optarg; break;
 		case 'p': port = optarg; break;
@@ -753,6 +846,18 @@ main(int argc, char *argv[])
 		case 't': threads = (unsigned)atoi(optarg); break;
 		case 'c': maxconn = (unsigned)atoi(optarg); break;
 		case 'k': health_ms = (unsigned)atoi(optarg); break;
+		case 'i': {
+			long v = atol(optarg);
+
+			/* seconds in, milliseconds out: a value that would
+			 * wrap the multiply would come back as a timeout far
+			 * shorter than was asked for, which reaps live
+			 * connections rather than idle ones */
+			if (v < 0 || v > 86400L)
+				die("-i must be between 0 and 86400 seconds");
+			idle_ms = (unsigned)v * 1000u;
+			break;
+		}
 		case 'B': backlog = atoi(optarg); break;
 		case 'q': verbosity(0); break;
 		case 'v': puts("kache-lb " VERSION); return 0;
@@ -805,7 +910,8 @@ main(int argc, char *argv[])
 		pool_init(w, maxconn);
 	}
 
-	pthread_create(&hc, NULL, health_main, NULL);
+	if (pthread_create(&hc, NULL, health_main, NULL) != 0)
+		die("cannot start the health checker");
 	for (i = 0; i < nworkers; i++) {
 		if (pthread_create(&workers[i].th, NULL, worker_main,
 		                   &workers[i]) != 0)

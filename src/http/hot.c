@@ -85,14 +85,25 @@ hot_admit(Hot *h, u64 hash, u64 now)
 
 void
 hot_fill(Hot *h, u64 hash, const void *k, u32 kl, const void *resp,
-         u32 rlen, u32 doff, u64 now)
+         u32 rlen, u32 doff, u64 now, i64 ttl)
 {
 	HotEnt *e = &h->ent[slot_of(hash)];
+	u64 window = h->window;
 
 	if (kl > CFG_HOT_KEY || rlen > CFG_HOT_RESP)
 		return;
+	/* The set trades staleness for not touching the store, but a ttl is
+	 * not staleness - it is the one thing the caller asked the store to
+	 * promise.  An entry that outlived the item would keep answering 200
+	 * with a body the store has already dropped, and with the ttl the
+	 * item had when it was copied, so the response would not even admit
+	 * to being old.  Whichever expires first wins. */
+	if (ttl >= 0 && (u64)ttl < window)
+		window = (u64)ttl;
+	if (!window)
+		return;
 	e->hash = hash;
-	e->until = now + h->window;
+	e->until = now + window;
 	e->gen = h->gen;
 	e->klen = kl;
 	e->rlen = rlen;

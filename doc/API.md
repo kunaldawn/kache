@@ -134,6 +134,12 @@ and a newline.  Length prefixing is what keeps values binary safe.
                                   abc
                                   -1
 
+A batch names keys but is answered with values, so the reply is bounded
+the way an enumeration is: it stops at 8 MiB of body and says so with
+`X-Kache-Truncated: 1`.  `X-Kache-Count` is then how many keys were
+answered rather than how many were asked for, so the rest are the keys
+after that many lines of the body just sent.
+
 Per key metadata is deliberately absent: use `GET /kv/<key>` when you
 need the `ETag` or the remaining TTL.
 
