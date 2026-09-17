@@ -7,8 +7,8 @@
 #
 # Ports, and which one you want:
 #
-#   7080  nginx, round robin over all three  <- a client that knows
-#                                               nothing about the cluster
+#   7080  kache-lb, round robin over all three  <- a client that knows
+#                                                  nothing about the cluster
 #   7071  kache0, nothing in the way  \
 #   7072  kache1, nothing in the way   }     <- benchmarks go here
 #   7073  kache2, nothing in the way  /
@@ -93,17 +93,17 @@ services:
               "-Y", "50", "-X", "50"]
 
   lb:
-    image: docker.io/library/nginx:1.27-alpine
+    build:
+      context: .
+      dockerfile: Containerfile
     container_name: kache-lb
     restart: unless-stopped
-    # nginx always listens on 8080 inside the network, so only the host
-    # side of this moves.
+    # Same image as the nodes; only the entrypoint differs.
+    entrypoint: ["/usr/local/bin/kache-lb"]
+    command: ["-l", "0.0.0.0", "-p", "8080",
+              "-b", "kache0:7070,kache1:7070,kache2:7070",
+              "-k", "1000"]
     ports: ["${PORT_LB:-7080}:8080"]
-    # Nothing to substitute: the nodes advertise their own client facing
-    # addresses through -U, so nginx has no redirects to rewrite and is
-    # only a round robin balancer.
-    volumes:
-      - ./deploy/nginx.conf:/etc/nginx/conf.d/kache.conf:ro
     depends_on:
       kache0: { condition: service_healthy }
       kache1: { condition: service_healthy }

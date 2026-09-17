@@ -17,6 +17,9 @@ CLUSTER = src/cluster/cluster.c
 HTTP = src/http/buf.c src/http/stats.c src/http/http.c src/http/hot.c \
        src/http/route.c src/http/conn.c src/http/server.c
 
+# lb/ a connection level balancer; it needs nothing but util/
+LB = src/lb/lb.c
+
 # the engine without the front end, so the microbenchmark can link it
 CORE = $(UTIL) $(STORE)
 COREOBJ = $(CORE:.c=.o)
@@ -33,7 +36,7 @@ HDR = src/util/util.h src/util/hash.h src/util/clk.h src/util/lock.h \
       src/http/route.h src/http/conn.h src/http/server.h \
       src/cluster/cluster.h config.h
 
-all: kache
+all: kache kache-lb
 
 options:
 	@echo kache build options:
@@ -53,6 +56,11 @@ $(OBJ): $(HDR)
 
 kache: $(OBJ)
 	$(CC) -o $@ $(OBJ) $(LDFLAGS) $(LIBS)
+
+# Deliberately not linked against the store: the balancer never looks
+# at a request, so it has no business knowing what one is.
+kache-lb: src/lb/lb.c src/util/util.o config.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ src/lb/lb.c src/util/util.o $(LDFLAGS)
 
 kache-bench: test/bench.c test/metric.h config.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ test/bench.c $(LDFLAGS)
@@ -85,18 +93,19 @@ debug:
 
 install: all
 	mkdir -p $(DESTDIR)$(PREFIX)/bin
-	cp -f kache $(DESTDIR)$(PREFIX)/bin
-	chmod 755 $(DESTDIR)$(PREFIX)/bin/kache
+	cp -f kache kache-lb $(DESTDIR)$(PREFIX)/bin
+	chmod 755 $(DESTDIR)$(PREFIX)/bin/kache $(DESTDIR)$(PREFIX)/bin/kache-lb
 	mkdir -p $(DESTDIR)$(MANPREFIX)/man1
 	cp -f doc/kache.1 $(DESTDIR)$(MANPREFIX)/man1/kache.1
 	chmod 644 $(DESTDIR)$(MANPREFIX)/man1/kache.1
 
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/kache
+	rm -f $(DESTDIR)$(PREFIX)/bin/kache-lb
 	rm -f $(DESTDIR)$(MANPREFIX)/man1/kache.1
 
 clean:
-	rm -f kache $(TOOLS) $(OBJ)
+	rm -f kache kache-lb $(TOOLS) $(OBJ)
 
 distclean: clean
 	rm -f config.h

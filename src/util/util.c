@@ -22,7 +22,10 @@ verbosity(int level)
 static void
 vmsg(const char *tag, const char *fmt, va_list ap)
 {
-	fprintf(stderr, "kache: %s", tag);
+	/* The binary's own name, not a literal, because kache and kache-lb
+	 * log to the same place when they run in the same stack and a line
+	 * that cannot say which one it came from is worth less. */
+	fprintf(stderr, "%s: %s", program_invocation_short_name, tag);
 	vfprintf(stderr, fmt, ap);
 	if (fmt[0] && fmt[strlen(fmt) - 1] == ':')
 		fprintf(stderr, " %s", strerror(errno));

@@ -82,11 +82,8 @@ visible on other nodes after one interval.
 If the address nodes use for each other is not the one clients can reach
 - containers, NAT, a proxy in front - `-U` gives the client facing
 address of each node in the same order, and redirects name that instead.
-`docker-compose.yml` is a worked example: three nodes and an nginx
-balancer, up with `docker compose up --build -d` and checked with
-`sh deploy/smoke.sh`.  Benchmark the node ports it publishes, never the
-balancer - nginx does not pipeline to an upstream and measured 261x
-slower on the same data.
+`docker-compose.yml` is a worked example: three nodes and a balancer, up
+with `docker compose up --build -d` and checked with `sh deploy/smoke.sh`.
 
 Every node needs the same `-C` list in the same order.  The hash seed is
 derived from that list, so the cluster agrees without configuration, and
@@ -98,6 +95,39 @@ stay node local; `/mset` and `/mdel` are not routed to owners; and a
 node that is down is retried on the next flush rather than failed over,
 so its keys keep their owner and the writes wait.
 
+kache-lb
+--------
+
+`kache-lb` is a connection level balancer for a cluster, built because an
+HTTP proxy is the wrong shape in front of this.  nginx does not pipeline
+to an upstream: against the same three nodes and the same client it
+carried 2,645 ops/s at pipeline depth 16 and 2,560 at depth 64 - no
+faster with more pipelining, because it replays the batch one request at
+a time.  `kache-lb` carried 501,784 and 1,308,396, which is **190x and
+511x**.
+
+It manages that by never parsing anything.  It is L4: accept, pick a
+backend, shuttle bytes until somebody hangs up, so a pipelined batch
+crosses it as a batch.  That works only because of how the cluster is
+built - every node holds a full copy so any node can answer any read,
+and a write that lands on a non owner is answered `307`, so the client
+goes straight to the owner and never comes back through the balancer.
+
+    $ kache-lb -p 7080 -b 10.0.0.1:7070,10.0.0.2:7070,10.0.0.3:7070
+
+Backends are health checked with `GET /health` once a second and taken
+out of rotation while they fail.  Measured at **0.230 syscalls per
+request** carried, against kache's own 0.1875, because 16 KiB buffers
+coalesce a batch at least as well as the client pipelined it.
+
+One thing to know before benchmarking it: a proxy adds a hop, and at a
+fixed number of in-flight requests throughput is concurrency divided by
+round trip time.  At depth 16 over two connections it measures 0.55x a
+single node - that is the extra hop, not the balancer.  At eight
+connections it is 1.07x, and at depth 64 it is 1.28x, because by then it
+is spreading the load it exists to spread.  If it looks slow, add
+concurrency before blaming it.
+
 Layout
 ------
 
@@ -107,6 +137,7 @@ Layout
     src/store/       the mapped file, allocator, index, operations
     src/http/        buffers, parser, router, connections, event loops
     src/cluster/     replication between nodes
+    src/lb/          kache-lb, a connection level balancer
     src/main.c       argument handling and startup
     test/test.sh     end to end checks (make check)
     test/micro.c     engine benchmarks, linked against the store

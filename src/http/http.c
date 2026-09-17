@@ -76,7 +76,7 @@ http_head(const char *buf, size_t len, Req *r)
 	const char *p = buf;
 	size_t left = len, adv;
 	long n;
-	int nhdr = 0;
+	int nhdr = 0, seen_clen = 0;
 	const char *sp1, *sp2, *q;
 
 	memset(r, 0, sizeof(*r));
@@ -143,8 +143,23 @@ http_head(const char *buf, size_t len, Req *r)
 		switch (lower((u8)name.p[0])) {
 		case 'c':
 			if (ieq(name.p, name.n, "content-length")) {
-				if (parse_u64(val.p, val.n, &r->clen) < 0)
+				u64 v;
+
+				if (parse_u64(val.p, val.n, &v) < 0)
 					return -400;
+				/* RFC 9112 6.3: a second Content-Length that
+				 * disagrees with the first is rejected, not
+				 * resolved.  Resolving it is what desynchronises
+				 * a proxy from its backend - the two pick
+				 * different values, the body of one becomes the
+				 * start of the next request for the other, and
+				 * that is request smuggling.  Which of the two
+				 * kache would have picked does not matter; that
+				 * it picks at all is the bug. */
+				if (seen_clen && v != r->clen)
+					return -400;
+				seen_clen = 1;
+				r->clen = v;
 			} else if (ieq(name.p, name.n, "connection")) {
 				if (ieq(val.p, val.n, "close"))
 					r->keepalive = 0;

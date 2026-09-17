@@ -12,6 +12,9 @@ RUN make distclean 2>/dev/null; make
 FROM docker.io/library/alpine:3.20
 RUN adduser -D -u 1000 kache && mkdir -p /data && chown kache /data
 COPY --from=build /src/kache /usr/local/bin/kache
+# The balancer ships in the same image: it is one small binary and
+# having it here means the cluster needs no second image to front it.
+COPY --from=build /src/kache-lb /usr/local/bin/kache-lb
 USER kache
 VOLUME /data
 EXPOSE 7070

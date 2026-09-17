@@ -4,8 +4,8 @@
 #     docker compose up --build -d && sh deploy/smoke.sh
 #
 # Everything here goes through the published ports, the way a client on
-# the host would, so it exercises the redirect rewriting in
-# deploy/nginx.conf as well as the cluster itself.
+# the host would, so it exercises kache-lb and the redirects as well as
+# the cluster itself.
 set -u
 
 LB=${LB:-http://127.0.0.1:7080}
@@ -172,8 +172,10 @@ if [ "$fails" -eq 0 ]; then
 	echo "  writes  curl -L -X PUT -d value $LB/kv/<key>   (-L follows"
 	echo "          the 307 to whichever node owns the key)"
 	echo "  bench   ./kache-bench -h 127.0.0.1 -p 7071 -W get -k 1 -P 16"
-	echo "          against 7071-7073, never 7080: nginx does not"
-	echo "          pipeline to an upstream, and measured 261x slower"
+	echo "          7080 is kache-lb and is fine to benchmark too, but"
+	echo "          give it concurrency: a proxy adds a hop, and at a"
+	echo "          fixed depth throughput is concurrency over latency."
+	echo "          -P 16 -t 2 measures 0.55x a node; -P 64 -t 8 is 1.28x"
 else
 	echo "$fails check(s) failed - docker compose logs will say why"
 fi

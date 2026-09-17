@@ -3,6 +3,7 @@
 *.d
 *.a
 /kache
+/kache-lb
 /kache-bench
 /kache-micro
 /kache-cmp
@@ -16,6 +17,11 @@ config.h
 
 # benchmark results only mean something on the machine that produced them
 /bench/
+
+# local port and advertised-address overrides for docker-compose;
+# docker-compose.yml carries the defaults, this would only ever hold
+# one machine's opinion of them
+.env
 
 # tooling
 compile_commands.json
