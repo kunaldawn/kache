@@ -37,6 +37,49 @@
 /* hash table load factor limit, in 256ths (192/256 = 0.75) */
 #define CFG_LOAD_LIMIT       192u
 
+/* ---- containers ------------------------------------------------------ */
+
+/* A nested map is open addressed like the shard index, at the same load
+ * factor.  Its slots are 8 bytes, so the smallest table is one cache
+ * line and covers a map of six fields without ever growing. */
+#define CFG_KKV_SLOTS_MIN    8u
+#define CFG_KKV_SLOTS_MAX    (1u << 26)
+#define CFG_KKV_LOAD         192u
+
+/* Queue segments start here and double up to the ceiling, so a queue of
+ * five messages does not pay for a queue of five million and a queue of
+ * five million does not allocate every few pushes.  An entry too large
+ * for the ceiling gets a segment of its own. */
+#define CFG_QSEG_MIN         512u
+#define CFG_QSEG_MAX         (32u << 10)
+/* an empty segment no larger than this is kept for the next push, so a
+ * queue that hovers around empty does not allocate on every message */
+#define CFG_QSEG_KEEP        4096u
+
+/* Entries one pop or one peek may return, and how many expired ones a
+ * read may clear off the ends before getting on with its work. */
+#define CFG_QPOP_MAX         4096u
+#define CFG_QEXPIRE_BUDGET   32u
+
+/* Sub blocks the sweeper reclaims on the way into an operation that may
+ * allocate.  Deleting a container is constant time because the work of
+ * dismantling it is spread over the requests that follow, a few blocks
+ * at a time; this is how many.  Larger reclaims memory sooner and costs
+ * the unlucky request more. */
+#define CFG_SWEEP_BUDGET     64u
+
+/* The same work, done by a worker's once a second housekeeping tick
+ * rather than by a request, so a shard nobody is asking about still
+ * gives its memory back.  It takes the shard lock with a try, never a
+ * wait: a busy shard is one whose own traffic is already sweeping it. */
+#define CFG_RECLAIM_BUDGET   4096u
+
+/* fields or entries one batch request may carry, and how many bytes one
+ * enumeration may answer with.  Both bound how long a shard lock is held
+ * by a single request, which is the real reason they exist. */
+#define CFG_CONT_BATCH_MAX   4096u
+#define CFG_CONT_DUMP_MAX    (8u << 20)
+
 /* ---- eviction ------------------------------------------------------- */
 
 /* candidates inspected per eviction; larger is a better LRU approximation */

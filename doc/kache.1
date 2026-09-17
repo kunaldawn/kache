@@ -3,7 +3,7 @@
 .Os
 .Sh NAME
 .Nm kache
-.Nd multi threaded, file backed key/value cache with an HTTP interface
+.Nd multi threaded, file backed cache with an HTTP interface
 .Sh SYNOPSIS
 .Nm
 .Op Fl mPHnMAFqvh
@@ -23,11 +23,17 @@
 .Op Fl V Ar bytes
 .Sh DESCRIPTION
 .Nm
-keeps a key/value cache in a file mapped
+keeps a cache in a file mapped
 .Dv MAP_SHARED ,
 so the data lives in the page cache while it is hot and survives a
 restart without a serialisation step.  Entries carry an optional time to
 live and a version used for compare and swap.  Clients speak HTTP/1.1.
+.Pp
+A key holds one of three things: a value, a nested map of fields, or a
+queue.  A container carries its own time to live and so does every item
+in it, independently.  Because a container lives entirely inside the
+shard its key hashes to, a multi field write, a whole map enumeration
+and a move between two queues are each atomic under one lock.
 .Pp
 The store is divided into independently locked shards, each with its own
 hash index and allocation arena.  When a shard runs out of room it evicts
@@ -197,6 +203,80 @@ The same in Prometheus form.
 Liveness.
 .El
 .Pp
+Nested maps.
+.Ql ?f=<field>
+names a field, percent encoded exactly like a key.
+.Bl -tag -width Ds
+.It Cm GET Ar /kkv/<key>
+Every live field, framed as
+.Ql <fieldlen> <valuelen> <ttl>
+followed by the field bytes and then the value bytes.  At most
+.Ql ?n=
+of them;
+.Ql ?n=0
+returns the counters alone.
+.It Cm GET Ar /kkv/<key>?f=<field>
+One field.  The
+.Ql ETag
+and
+.Ql X-Kache-TTL
+describe the field, not the map.
+.It Cm PUT Ar /kkv/<key>?f=<field>
+Store one field, creating the map if needed.
+.It Cm POST Ar /kkv/<key>
+Many fields under one hold of the lock, in the same frames.
+.It Cm DELETE Ar /kkv/<key>?f=<field>
+Remove one field; without
+.Ql ?f=
+the whole map.
+.It Cm POST Ar /kkvdel/<key>
+Many fields, framed as
+.Ql <len>
+and the name bytes.
+.It Cm POST Ar /kkvincr/<key>?f=<field>
+Add
+.Ql ?by=
+to a field, as
+.Ar /incr
+does to a key.
+.Ar /kkvdecr
+subtracts.
+.It Cm POST Ar /kkvtouch/<key>
+A new ttl for
+.Ql ?f=
+or, without it, for the map.
+.El
+.Pp
+Queues.
+.Ql ?side=l
+or
+.Ql ?side=r
+names an end; pushes default to the right and pops to the left, which
+makes the plain calls a FIFO.
+.Bl -tag -width Ds
+.It Cm POST Ar /q/<key>
+Push the body as one message.
+.It Cm POST Ar /qpush/<key>
+Push many, framed as
+.Ql <valuelen> [ttl]
+and the bytes.
+.It Cm POST Ar /qpop/<key>
+Pop one, answering with its bytes, or
+.Ql ?n=
+of them, framed.  204 when there is nothing to take.
+.It Cm GET Ar /q/<key>
+The same without removing anything.
+.It Cm POST Ar /qmove/<key>?dst=<key>
+Take one message off this queue and put it on another, under both locks
+at once, and answer with it.  The message is never in neither queue.
+.It Cm POST Ar /qtrim/<key>?maxlen=<n>
+Keep at most that many.
+.It Cm POST Ar /qtouch/<key>
+A new ttl for the queue.
+.It Cm DELETE Ar /q/<key>
+Remove the queue.
+.El
+.Pp
 .Ql ?ttl=<seconds>
 or
 .Ql ?ttlms=<milliseconds>
@@ -209,8 +289,26 @@ when the condition fails.  Every operation is atomic with respect to
 every other operation on the same key.
 .Pp
 The batch endpoints exist because a round trip costs far more than a
-lookup does.  They are not atomic across keys: each key is taken under
-its own shard lock in turn.
+lookup does.
+.Ar /mget , /mset
+and
+.Ar /mdel
+are not atomic across keys: each key is taken under its own shard lock in
+turn.  The container batches are, because every item in one container is
+under one lock.
+.Pp
+.Ql ?kttl=<seconds>
+sets a container's own expiry, which is independent of the items in it
+and is applied only when the request carries it, so writing one field
+does not restart the clock on the map.  A container that loses its last
+item stops existing.
+.Pp
+Deleting a container is constant time whatever its size: it leaves the
+index at once and is taken apart afterwards by the requests that follow
+it and by a once a second housekeeping tick.
+.Ql kache_reclaim_pending
+counts what is still waiting.  An allocation that cannot be met reclaims
+all of it before evicting anything a client can still read.
 .Sh FILES
 .Bl -tag -width Ds
 .It Pa config.def.h
@@ -229,6 +327,15 @@ Store and read a value:
 .Pp
 .Dl $ curl -X PUT -d hello localhost:7070/kv/greeting
 .Dl $ curl localhost:7070/kv/greeting
+.Pp
+A map with a day on the key and a minute on one of its fields:
+.Pp
+.Dl $ curl -X PUT -d alice localhost:7070/kkv/user:1?f=name&kttl=86400
+.Dl $ curl -X PUT -d tok localhost:7070/kkv/user:1?f=session&ttl=60
+.Pp
+A worker taking one job off a queue without being able to lose it:
+.Pp
+.Dl $ curl -X POST 'localhost:7070/qmove/work?dst=work:inflight'
 .Sh DIAGNOSTICS
 On startup after an unclean shutdown
 .Nm

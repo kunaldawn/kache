@@ -29,11 +29,18 @@
  * for everything a local cache does and costs 256 KiB a thread. */
 #define HBUCKETS 65536
 
-enum { W_GET, W_SET, W_MIXED, W_INCR, W_MGET, W_FILL };
+enum { W_GET, W_SET, W_MIXED, W_INCR, W_MGET, W_FILL,
+       W_KKV, W_KKVSET, W_QCYCLE, W_KKVFILL };
 
 static const char *const wnames[] = {
-	"get", "set", "mixed", "incr", "mget", "fill"
+	"get", "set", "mixed", "incr", "mget", "fill",
+	"kkv", "kkvset", "qcycle", "kkvfill"
 };
+
+/* fields per map in the container workloads, and how many queues the
+ * cycle workload spreads its pushes over */
+#define FIELDS  32
+#define QUEUES  256
 
 static const char *host = "127.0.0.1";
 static const char *port = "7070";
@@ -166,6 +173,26 @@ build(Thread *t, u64 *s, int n)
 
 		switch (workload) {
 		case W_GET:   write = 0; break;
+		case W_KKV:
+			len += (size_t)snprintf(t->req + len, t->reqcap - len,
+			    "GET /kkv/m%u?f=f%u HTTP/1.1\r\nHost: b\r\n\r\n",
+			    k / FIELDS, k % FIELDS);
+			continue;
+		case W_KKVSET:
+			len += (size_t)snprintf(t->req + len, t->reqcap - len,
+			    "PUT /kkv/m%u?f=f%u HTTP/1.1\r\nHost: b\r\n"
+			    "Content-Length: %d\r\n\r\n%s",
+			    k / FIELDS, k % FIELDS, valsize, t->val);
+			continue;
+		case W_QCYCLE:
+			/* a push and a pop of the same queue, so the depth
+			 * stays where the fill left it */
+			len += (size_t)snprintf(t->req + len, t->reqcap - len,
+			    "POST /q/q%u HTTP/1.1\r\nHost: b\r\n"
+			    "Content-Length: %d\r\n\r\n%s"
+			    "POST /qpop/q%u HTTP/1.1\r\nHost: b\r\n\r\n",
+			    k % QUEUES, valsize, t->val, k % QUEUES);
+			continue;
 		case W_SET:   write = 1; break;
 		case W_MIXED: write = (int)(r & 0x7f) >= readpct * 127 / 100;
 		              break;
@@ -273,6 +300,41 @@ run_fill(Thread *t)
 	}
 }
 
+/* The same keyspace arranged as maps of FIELDS fields, plus one message
+ * in every queue, so the container scenarios measure a steady state
+ * rather than the creation of one. */
+static void
+run_kkvfill(Thread *t)
+{
+	int k;
+
+	for (k = t->id; k < keyspace; k += nthreads) {
+		size_t len = (size_t)snprintf(t->req, t->reqcap,
+		    "PUT /kkv/m%u?f=f%u HTTP/1.1\r\nHost: b\r\n"
+		    "Content-Length: %d\r\n\r\n%s",
+		    (unsigned)k / FIELDS, (unsigned)k % FIELDS, valsize,
+		    t->val);
+
+		if (write(t->fd, t->req, len) != (ssize_t)len)
+			return;
+		if (await(t, 1) < 0)
+			return;
+		t->ops++;
+	}
+	for (k = t->id; k < QUEUES; k += nthreads) {
+		size_t len = (size_t)snprintf(t->req, t->reqcap,
+		    "POST /q/q%u HTTP/1.1\r\nHost: b\r\n"
+		    "Content-Length: %d\r\n\r\n%s", (unsigned)k, valsize,
+		    t->val);
+
+		if (write(t->fd, t->req, len) != (ssize_t)len)
+			return;
+		if (await(t, 1) < 0)
+			return;
+		t->ops++;
+	}
+}
+
 static void *
 worker(void *arg)
 {
@@ -284,8 +346,11 @@ worker(void *arg)
 		        host, port);
 		return NULL;
 	}
-	if (workload == W_FILL) {
-		run_fill(t);
+	if (workload == W_FILL || workload == W_KKVFILL) {
+		if (workload == W_FILL)
+			run_fill(t);
+		else
+			run_kkvfill(t);
 		close(t->fd);
 		return NULL;
 	}
@@ -299,11 +364,13 @@ worker(void *arg)
 			t0 = now_s();
 		if (write(t->fd, t->req, len) != (ssize_t)len)
 			break;
-		if (await(t, pipeline) < 0)
+		if (await(t, pipeline * (workload == W_QCYCLE ? 2 : 1)) < 0)
 			break;
 		if (latency)
 			hist_add(t, now_s() - t0);
-		t->ops += (u64)pipeline * (workload == W_MGET ? (u64)batch : 1);
+		t->ops += (u64)pipeline *
+		    (workload == W_MGET ? (u64)batch :
+		     workload == W_QCYCLE ? 2u : 1u);
 	}
 	close(t->fd);
 	return NULL;
@@ -410,7 +477,7 @@ main(int argc, char *argv[])
 		usage(2);
 	if (latency)
 		pipeline = 1;
-	if (workload == W_FILL) {
+	if (workload == W_FILL || workload == W_KKVFILL) {
 		reps = 1;
 		warmup = 0;
 	}

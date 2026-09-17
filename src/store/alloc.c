@@ -203,12 +203,12 @@ alc_place_free(Map *m, Shard *s, u64 off, u32 size, u32 prev)
 }
 
 void
-alc_place_used(Map *m, Shard *s, u64 off, u32 size, u32 prev)
+alc_place_used(Map *m, Shard *s, u64 off, u32 size, u32 prev, u32 flags)
 {
 	Blk *b = alc_blk(m, off);
 
 	b->prev = prev;
-	b->size = size | BLK_INUSE;
+	b->size = size | BLK_INUSE | flags;
 	s->used += size;
 }
 

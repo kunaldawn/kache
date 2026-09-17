@@ -1,15 +1,31 @@
 kache
 =====
 
-A multi threaded, in memory, file backed key/value cache with TTLs and
-atomic operations, spoken to over HTTP.  Written from scratch in C11,
-with no dependencies beyond libc and Linux.
+A multi threaded, in memory, file backed cache with TTLs and atomic
+operations, spoken to over HTTP.  A key holds a value, a nested map, or a
+queue.  Written from scratch in C11, with no dependencies beyond libc and
+Linux.
 
     $ make
     $ ./kache -f /var/tmp/kache.db -s 4G -p 7070
+
     $ curl -X PUT -d 'hello' 'localhost:7070/kv/greeting?ttl=60'
     $ curl localhost:7070/kv/greeting
     hello
+
+    # a nested map: a day on the key, a minute on one of its fields
+    $ curl -X PUT -d alice 'localhost:7070/kkv/user:1?f=name&kttl=86400'
+    $ curl -X PUT -d tok42 'localhost:7070/kkv/user:1?f=tok&ttl=60'
+    $ curl localhost:7070/kkv/user:1
+    4 5 -1
+    namealice
+    3 5 60
+    toktok42
+
+    # a queue, and a worker taking one job without ever losing it
+    $ curl -X POST -d 'job payload' localhost:7070/q/work
+    $ curl -X POST 'localhost:7070/qmove/work?dst=work:inflight'
+    job payload
 
 Why it looks like this
 ----------------------
@@ -52,6 +68,14 @@ Each layer only ever includes downwards: `http/` knows about `store/`,
 Design in one page
 ------------------
 
+**Containers.**  A nested map and a queue each live entirely inside the
+shard their outer key hashes to, so the one lock that covers the key
+covers everything in it.  That is what buys atomic multi field writes,
+whole map enumeration and a move between two queues - none of which a
+flattened `outer\0inner` key space can give you, because there the
+pieces land in different shards.  Both levels carry their own TTL, and
+they are independent.
+
 **Sharding.**  The key space is split into independent shards, each with
 its own lock, index and arena.  The top bits of the hash pick the shard
 and the low bits pick the bucket, so the two selections are uncorrelated.
@@ -83,6 +107,28 @@ recently used of the sample goes.  When the request is for a large block,
 eviction continues into the victim's forward neighbours until the merged
 run is big enough - which is how a 60 KiB value still gets in when the
 arena is a mosaic of 500 byte records.
+
+**Maps.**  Open addressed like the shard index, but the slots are 8
+bytes rather than 16 - a small table needs no more than 32 bits of hash
+to reject a collision - so eight fit in a cache line and most lookups
+touch one.  The tag is the low half of the hash, which is also the
+slot's home, so growing rehashes the slot array without reading a single
+field record.
+
+**Queues.**  Messages live inside segments rather than in blocks of
+their own: one allocation feeds dozens of pushes, and a queue being
+drained stays contiguous.  Each entry carries its frame length at both
+ends, so a pop from either side is a constant time step - the allocator's
+boundary tags, one level up.  Segments start small and double, so a
+queue of five messages does not pay for a queue of five million.
+
+**Deferred reclamation.**  Deleting a map of a hundred thousand fields
+is a constant time request.  The container leaves the index at once and
+is taken apart afterwards, a few blocks at a time, by the traffic that
+follows it and by a once a second tick that never waits for a lock.  An
+allocation that cannot be met drains that backlog before it evicts
+anything a client can still read, so the memory is handed back late,
+never lost.
 
 **Time.**  Expiry is an absolute wall clock millisecond stamp, so TTLs
 mean the same thing across a restart.  Every worker refreshes a cached
@@ -127,10 +173,43 @@ HTTP interface
     GET    /metrics        the same, in prometheus form
     GET    /health         liveness
 
+    GET    /kkv/<key>              every field, framed
+    GET    /kkv/<key>?f=<field>    one field
+    PUT    /kkv/<key>?f=<field>    store one field
+    POST   /kkv/<key>              many fields, atomically
+    DELETE /kkv/<key>[?f=<field>]  one field, or the whole map
+    POST   /kkvdel/<key>           many fields, framed names
+    POST   /kkvincr/<key>?f=       add ?by=N to a field
+    POST   /kkvtouch/<key>[?f=]    a field's ttl, or the map's
+
+    POST   /q/<key>                push the body
+    POST   /qpush/<key>            push many, framed
+    POST   /qpop/<key>             pop ?n (default 1)
+    GET    /q/<key>                the same without removing
+    POST   /qmove/<key>?dst=<key>  pop one and push it, under both locks
+    POST   /qtrim/<key>?maxlen=    keep at most that many
+    POST   /qtouch/<key>           the queue's ttl
+    DELETE /q/<key>                remove the queue
+
 `?ttl=<seconds>` or `?ttlms=<ms>` sets the expiry, `0` meaning never.
-`If-None-Match: *` stores only if the key is absent; `If-Match: "<etag>"`
-stores or deletes only if the value is still the one you read.  Every
-mutation is atomic with respect to every other operation on that key.
+`?kttl=` sets a container's own expiry, which is independent of the
+items inside it.  `?f=<field>` names a field, percent encoded exactly
+like a key, because a second path segment could not say where an outer
+key containing a slash ends.  `If-None-Match: *` stores only if the key
+is absent; `If-Match: "<etag>"` stores or deletes only if the value is
+still the one you read, and applies to the field when there is one.
+Every mutation is atomic with respect to every other operation on that
+key - for a container, that includes the ones touching many of its items
+at once.
+
+Anything carrying more than one item is framed by length rather than
+delimited, so names and values are binary safe:
+
+    map:   "<fieldlen> <valuelen> [ttl]\n" <field> <value> "\n"
+    queue: "<valuelen> [ttl]\n" <value> "\n"
+
+A map's dump is a legal body for a write, so copying one is two
+requests.
 
 See `doc/API.md` for the full reference, including status codes.
 
@@ -215,8 +294,51 @@ A `GET` costs about 230 ns in the store and 27 microseconds getting there
 and back, so for anything that needs more than one key the round trip is
 the whole cost.
 
+The containers are measured the same way, and the engine tier is where
+the shape shows.  Per operation, one thread, 64 byte values:
+
+    plain GET                        260 ns
+    GET one field of a map           237 ns
+    PUT one field of a map           255 ns
+    enumerate a map, per field        26 ns     one lock, one walk
+    queue push or pop                 88 ns     no allocator, no index
+    queue push or pop, batched        14 ns     64 messages a request
+
+A field lookup is two hashes and two probes and still comes out level
+with a plain `GET`, because the map and the fields it points at sit
+beside each other in the arena while a hundred thousand loose keys do
+not.  Reading a whole map costs a tenth of what fetching its fields one
+at a time would, and that is the point of the shape.
+
+Over HTTP, 8 client threads at 16 deep, on one run so the numbers are
+comparable with each other:
+
+    GET /kv/<key>                2,797,764 ops/s
+    GET /kkv/<key>?f=<field>     2,475,361 ops/s
+    PUT /kv/<key>                2,477,630 ops/s
+    PUT /kkv/<key>?f=<field>     1,483,778 ops/s
+    POST /q + POST /qpop         2,407,455 ops/s
+
+The one gap is the field write, and it is not the store: the engine has
+the two within four percent of each other.  It is the request saying
+more - a longer path, a field to decode, two expiries to look for - and
+it is paid in the parser.
+
 Limits worth knowing
 --------------------
+
+A container lives in one shard, so it cannot outgrow one shard's arena -
+roughly `-s` divided by the shard count, which `/stats` reports as
+`bytes_capacity` over `buckets`.  A map or queue that reaches it answers
+`507` and stays exactly as it was; the rest of the store is unaffected,
+because the other shards were never involved.  Fewer shards with `-S`
+buys a larger ceiling per container at the cost of more lock contention,
+and that is the whole of the trade.
+
+There is no blocking pop: parking a connection on a queue and waking it
+from another worker's thread is a scheduler inside the event loop, built
+for one call.  A consumer polls, or holds a connection open and pops a
+batch - `?n=64` costs one round trip instead of sixty four.
 
 It is a cache, not a database.  Writes reach the file when the kernel
 decides, or every `-y` milliseconds, or on a clean shutdown; a crash can

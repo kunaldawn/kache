@@ -169,6 +169,203 @@ case "$got" in
 *) bad "mget binary safe" "got '$got'" ;;
 esac
 
+echo "nested maps"
+check "map put field"     201 -X PUT -d alice "$URL/kkv/u1?f=name"
+body  "map get field"     alice "$URL/kkv/u1?f=name"
+check "map second field"  201 -X PUT -d 30 "$URL/kkv/u1?f=age"
+check "map replace field" 204 -X PUT -d 31 "$URL/kkv/u1?f=age"
+body  "map replaced"      31 "$URL/kkv/u1?f=age"
+body  "map incr field"    36 -X POST "$URL/kkvincr/u1?f=age&by=5"
+body  "map decr field"    34 -X POST "$URL/kkvdecr/u1?f=age&by=2"
+check "map missing field" 404 "$URL/kkv/u1?f=nope"
+check "map missing key"   404 "$URL/kkv/nosuch?f=x"
+check "map needs a field" 400 -X POST "$URL/kkvincr/u1"
+h=$(hdr "$URL/kkv/u1?n=0")
+has   "map field count"   "$h" '^X-Kache-Count: 2$'
+got=$(curl -sS -m 10 "$URL/kkv/u1" | tr '\n' '|')
+case "$got" in
+*'4 5 -1|namealice|'*) ok "map dump frames" ;;
+*) bad "map dump frames" "got '$got'" ;;
+esac
+check "map delete field"  204 -X DELETE "$URL/kkv/u1?f=age"
+h=$(hdr "$URL/kkv/u1?n=0")
+has   "map count after"   "$h" '^X-Kache-Count: 1$'
+check "map drop"          204 -X DELETE "$URL/kkv/u1"
+check "map gone"          404 "$URL/kkv/u1?f=name"
+# an empty map stops existing, so the last field taking the key with it
+check "map last field"    201 -X PUT -d only "$URL/kkv/u2?f=solo"
+check "map remove last"   204 -X DELETE "$URL/kkv/u2?f=solo"
+check "map went with it"  404 "$URL/kkv/u2"
+
+echo "map conditional writes"
+fetag=$(hdr -X PUT -d v1 "$URL/kkv/c1?f=x" | sed -n 's/^ETag: "\(.*\)"$/\1/p')
+check "map cas mismatch"  412 -X PUT -H 'If-Match: "999999"' -d v2 "$URL/kkv/c1?f=x"
+check "map cas match"     204 -X PUT -H "If-Match: \"$fetag\"" -d v2 "$URL/kkv/c1?f=x"
+body  "map cas applied"   v2 "$URL/kkv/c1?f=x"
+check "map add existing"  412 -X PUT -H 'If-None-Match: *' -d v3 "$URL/kkv/c1?f=x"
+check "map add new"       201 -X PUT -H 'If-None-Match: *' -d v3 "$URL/kkv/c1?f=y"
+check "map replace absent" 412 -X PUT -H 'If-Match: *' -d v "$URL/kkv/c1?f=z"
+
+echo "map ttls"
+check "map field ttl"     201 -X PUT -d short "$URL/kkv/t1?f=a&ttlms=200"
+check "map field forever" 201 -X PUT -d long "$URL/kkv/t1?f=b"
+sleep 0.5
+check "map field expired" 404 "$URL/kkv/t1?f=a"
+body  "map field kept"    long "$URL/kkv/t1?f=b"
+check "map key ttl"       201 -X PUT -d v "$URL/kkv/t2?f=a&kttlms=200"
+sleep 0.5
+check "map key expired"   404 "$URL/kkv/t2?f=a"
+# a write to one field must not restart the clock on the key
+check "map key ttl set"   201 -X PUT -d v "$URL/kkv/t3?f=a&kttl=100"
+curl -sS -o /dev/null -X PUT -d w "$URL/kkv/t3?f=b"
+h=$(hdr "$URL/kkv/t3?n=0")
+has   "map key ttl kept"  "$h" '^X-Kache-Key-TTL: 100$'
+check "map touch field"   204 -X POST "$URL/kkvtouch/t3?f=a&ttl=50"
+check "map touch key"     204 -X POST "$URL/kkvtouch/t3?ttl=0"
+h=$(hdr "$URL/kkv/t3?n=0")
+has   "map key made permanent"    "$h" '^X-Kache-Key-TTL: -1$'
+
+echo "map batches"
+printf '1 3 0\na123\n2 4 0\nbbWXYZ\n' > "$DIR/kkvset"
+check "map batch set"     204 -X POST --data-binary "@$DIR/kkvset" "$URL/kkv/b1"
+body  "map batch first"   123 "$URL/kkv/b1?f=a"
+body  "map batch second"  WXYZ "$URL/kkv/b1?f=bb"
+# a dump is a legal body for a write, which is what makes a copy one line
+curl -sS -m 10 -o "$DIR/kkvdump" "$URL/kkv/b1"
+check "map dump reloads"  204 -X POST --data-binary "@$DIR/kkvdump" "$URL/kkv/b2"
+body  "map copy intact"   WXYZ "$URL/kkv/b2?f=bb"
+printf '1\na\n2\nbb\n' > "$DIR/kkvdel"
+check "map batch delete"  204 -X POST --data-binary "@$DIR/kkvdel" "$URL/kkvdel/b1"
+check "map emptied"       404 "$URL/kkv/b1"
+check "map batch junk"    400 -X POST --data-binary 'x 1
+v' "$URL/kkv/b3"
+check "map junk stored nothing" 404 "$URL/kkv/b3"
+# lengths are explicit, so a field name may contain anything at all
+printf '3 5 0\na\nb\000x\ny\n' > "$DIR/kkvbin"
+check "map binary frame"  204 -X POST --data-binary "@$DIR/kkvbin" "$URL/kkv/b4"
+curl -sS -m 10 -o "$DIR/kkvbinout" "$URL/kkv/b4"
+got=$(od -An -c < "$DIR/kkvbinout" | tr -s ' ')
+case "$got" in
+*'a \n b \0 x \n y \n'*) ok "map binary safe" ;;
+*) bad "map binary safe" "got '$got'" ;;
+esac
+
+echo "type safety"
+curl -sS -o /dev/null -X PUT -d plain "$URL/kv/mixed"
+check "map on a value"    409 "$URL/kkv/mixed?f=a"
+check "queue on a value"  409 -X POST -d x "$URL/q/mixed"
+curl -sS -o /dev/null -X PUT -d f "$URL/kkv/mixed2?f=a"
+check "value on a map"    409 "$URL/kv/mixed2"
+check "queue on a map"    409 -X POST -d x "$URL/q/mixed2"
+check "delete crosses types" 204 -X DELETE "$URL/kv/mixed2"
+
+echo "queues"
+check "queue push"        201 -X POST -d job1 "$URL/q/w1"
+check "queue push more"   204 -X POST -d job2 "$URL/q/w1"
+curl -sS -o /dev/null -X POST -d job3 "$URL/q/w1"
+h=$(hdr -I "$URL/q/w1")
+has   "queue length"      "$h" '^X-Kache-Count: 3$'
+body  "queue peek head"   job1 "$URL/q/w1"
+body  "queue peek tail"   job3 "$URL/q/w1?side=r"
+body  "queue pop is fifo" job1 -X POST "$URL/qpop/w1"
+body  "queue pop again"   job2 -X POST "$URL/qpop/w1"
+got=$(curl -sS -m 10 -X POST "$URL/qpop/w1?n=5" | tr '\n' '|')
+case "$got" in
+'4 -1 3|job3|') ok "queue framed pop" ;;
+*) bad "queue framed pop" "got '$got'" ;;
+esac
+check "queue drained"     204 -X POST "$URL/qpop/w1"
+check "queue push left"   201 -X POST -d b "$URL/q/w2"
+curl -sS -o /dev/null -X POST -d a "$URL/q/w2?side=l"
+body  "queue left end"    a "$URL/q/w2"
+check "queue drop"        204 -X DELETE "$URL/q/w2"
+check "queue gone"        204 -X POST "$URL/qpop/w2"
+
+echo "queue batches and moves"
+printf '4 0\njobA\n4 0\njobB\n4 0\njobC\n' > "$DIR/qpush"
+check "queue batch push"  201 -X POST --data-binary "@$DIR/qpush" "$URL/qpush/w3"
+h=$(hdr -I "$URL/q/w3")
+has   "queue batch count" "$h" '^X-Kache-Count: 3$'
+body  "queue move"        jobA -X POST "$URL/qmove/w3?dst=w4"
+body  "queue moved to"    jobA "$URL/q/w4"
+h=$(hdr -I "$URL/q/w3")
+has   "queue move took"   "$h" '^X-Kache-Count: 2$'
+check "queue move empty"  204 -X POST "$URL/qmove/nosuchq?dst=w4"
+check "queue move needs dst" 400 -X POST "$URL/qmove/w3"
+check "queue trim"        204 -X POST "$URL/qtrim/w3?maxlen=1"
+body  "queue trim kept newest" jobC "$URL/q/w3"
+for m in m1 m2 m3 m4; do curl -sS -o /dev/null -X POST -d "$m" "$URL/q/w5?maxlen=2"; done
+got=$(curl -sS -m 10 "$URL/q/w5?n=9" | tr '\n' '|')
+case "$got" in
+*'m3|'*'m4|') ok "queue maxlen on push" ;;
+*) bad "queue maxlen on push" "got '$got'" ;;
+esac
+check "queue entry ttl"   201 -X POST -d gone "$URL/q/w6?ttlms=200"
+curl -sS -o /dev/null -X POST -d stays "$URL/q/w6"
+sleep 0.5
+body  "queue skipped expired" stays -X POST "$URL/qpop/w6"
+check "queue touch"       201 -X POST -d v "$URL/q/w7"
+check "queue key ttl"     204 -X POST "$URL/qtouch/w7?ttlms=200"
+sleep 0.5
+check "queue key expired" 204 -X POST "$URL/qpop/w7"
+check "queue bad side"    400 -X POST "$URL/qpop/w3?side=middle"
+
+echo "containers at scale"
+awk 'BEGIN { for (i = 0; i < 2000; i++) printf "%d %d 0\nf%dvalue-%d\n", length("f" i), length("value-" i), i, i }' \
+	> "$DIR/bigmap"
+check "big map set"       204 -X POST --data-binary "@$DIR/bigmap" "$URL/kkv/big"
+h=$(hdr "$URL/kkv/big?n=0")
+has   "big map count"     "$h" '^X-Kache-Count: 2000$'
+body  "big map spot"      value-1999 "$URL/kkv/big?f=f1999"
+got=$(curl -sS -m 10 "$URL/kkv/big?n=2000" | wc -l)
+[ "$got" = 4000 ] && ok "big map dump" || bad "big map dump" "got $got lines"
+awk 'BEGIN { for (i = 0; i < 2000; i++) printf "%d 0\nmsg-%d\n", length("msg-" i), i }' \
+	> "$DIR/bigq"
+check "big queue push"    201 -X POST --data-binary "@$DIR/bigq" "$URL/qpush/bigq"
+body  "big queue head"    msg-0 "$URL/q/bigq"
+body  "big queue tail"    msg-1999 "$URL/q/bigq?side=r"
+got=$(curl -sS -m 10 -X POST "$URL/qpop/bigq?n=2000" | wc -l)
+[ "$got" = 4000 ] && ok "big queue drain" || bad "big queue drain" "got $got lines"
+check "big queue emptied" 204 -X POST "$URL/qpop/bigq"
+# dropping a container is constant time; the sweeper does the work after
+check "big map drop"      204 -X DELETE "$URL/kkv/big"
+# nothing is asking after that key, so this waits on the housekeeping
+# tick rather than on traffic
+i=0
+while [ "$(curl -sS -m 10 "$URL/metrics" | sed -n 's/^kache_reclaim_pending //p')" != 0 ]; do
+	i=$((i + 1))
+	[ $i -gt 40 ] && break
+	sleep 0.25
+done
+pending=$(curl -sS -m 10 "$URL/metrics" | sed -n 's/^kache_reclaim_pending //p')
+[ "$pending" = 0 ] && ok "deferred reclaim finishes" \
+	|| bad "deferred reclaim finishes" "still $pending pending"
+# A container lives in one shard, so it stops growing at that shard's
+# arena.  What matters is that it stops cleanly and stays readable.
+i=0
+code=204
+while [ "$code" = 204 ] && [ $i -lt 60 ]; do
+	i=$((i + 1))
+	awk -v r="$i" 'BEGIN {
+		v = sprintf("%1000s", ""); gsub(/ /, "x", v)
+		for (j = 0; j < 200; j++) {
+			f = "b" r "_" j
+			printf "%d %d 0\n%s%s\n", length(f), length(v), f, v
+		}
+	}' > "$DIR/fillmap"
+	code=$(curl -sS -m 30 -o /dev/null -w '%{http_code}' -X POST \
+		--data-binary "@$DIR/fillmap" "$URL/kkv/fullmap")
+done
+[ "$code" = 507 ] && ok "container stops at its shard" \
+	|| bad "container stops at its shard" "got $code after $i batches"
+count=$(hdr "$URL/kkv/fullmap?n=0" | sed -n 's/^X-Kache-Count: //p')
+[ "${count:-0}" -gt 200 ] && ok "full container still readable" \
+	|| bad "full container still readable" "count is ${count:-none}"
+got=$(curl -sS -m 10 "$URL/kkv/fullmap?f=b1_0" | wc -c)
+[ "$got" = 1000 ] && ok "full container spot read" \
+	|| bad "full container spot read" "got $got bytes"
+check "full container drops"  204 -X DELETE "$URL/kkv/fullmap"
+
 echo "limits and errors"
 long=$(printf 'k%.0s' $(seq 1 600))
 check "key too long"      414 -X PUT -d x "$URL/kv/$long"
@@ -188,6 +385,8 @@ echo "flush and persistence"
 check "flush"             204 -X POST "$URL/flush"
 check "flushed"           404 "$URL/kv/a"
 check "reput"             201 -X PUT -d survivor "$URL/kv/keep"
+curl -sS -o /dev/null -X PUT -d mapvalue "$URL/kkv/keepmap?f=fld"
+curl -sS -o /dev/null -X POST -d queued "$URL/q/keepq"
 kill -TERM "$pid"; wait "$pid" 2>/dev/null; pid=
 "$BIN" -f "$DIR/test.db" -s 64M -p "$PORT" -F -q >>"$DIR/log" 2>&1 &
 pid=$!
@@ -198,6 +397,8 @@ while ! curl -sS -m 1 -o /dev/null "$URL/health" 2>/dev/null; do
 	sleep 0.1
 done
 body  "survived restart"  survivor "$URL/kv/keep"
+body  "map survived restart"   mapvalue "$URL/kkv/keepmap?f=fld"
+body  "queue survived restart" queued "$URL/q/keepq"
 kill -KILL "$pid"; wait "$pid" 2>/dev/null; pid=
 "$BIN" -f "$DIR/test.db" -s 64M -p "$PORT" -F -q >>"$DIR/log" 2>&1 &
 pid=$!
@@ -208,6 +409,8 @@ while ! curl -sS -m 1 -o /dev/null "$URL/health" 2>/dev/null; do
 	sleep 0.1
 done
 body  "survived a crash"  survivor "$URL/kv/keep"
+body  "map survived a crash"   mapvalue "$URL/kkv/keepmap?f=fld"
+body  "queue survived a crash" queued "$URL/q/keepq"
 
 echo "key decoding"
 check "escaped key put"   201 -X PUT -d roundtrip "$URL/kv/abc"

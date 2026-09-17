@@ -209,6 +209,14 @@ run http_incr  -W incr  -t "$THREADS" -P "$PIPE" -k 10000
 	"$(sed -n 's/^http_mget\.ops_per_sec //p' "$OUT")"
 run http_lat   -W mixed -t "$THREADS" -L -R 90
 
+# the containers, over the same socket.  The keyspace is arranged as
+# maps of 32 fields, so the two tiers hold the same number of items.
+./kache-bench -p "$PORT" -W kkvfill -k "$KEYS" -v "$VALSIZE" \
+	-t "$THREADS" >/dev/null
+run http_kkv    -W kkv    -t "$THREADS" -P "$PIPE"
+run http_kkvset -W kkvset -t "$THREADS" -P "$PIPE"
+run http_qcycle -W qcycle -t "$THREADS" -P "$PIPE"
+
 # what the store looked like at the end, for context when a number moves
 curl -sS "http://127.0.0.1:$PORT/stats" |
 	sed -n 's/^\(keys\|bytes_used\|bytes_capacity\|evictions_total\|expirations_total\) /store.\1 /p' \

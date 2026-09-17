@@ -25,6 +25,8 @@
 #define BATCH   64          /* ops between stop flag checks */
 #define VAL_MAX 8192
 #define KEY_MAX 32
+#define FIELDS  32          /* fields per map in the container workloads */
+#define QDEPTH  1024        /* entries a queue is held at */
 
 static Db db;
 static const char *path = "/tmp/kache-micro.db";
@@ -35,6 +37,8 @@ static double secs = 0.5;
 static int reps = 3;
 static int warmup = 1;
 static int maxthreads;
+
+static u32 nmaps = 1, nqueues = 256;
 
 static _Atomic int go, stop;
 static _Atomic u64 newkey;    /* handed out by the insert workloads */
@@ -53,6 +57,13 @@ static u32
 mkkey(char *b, u64 i)
 {
 	b[0] = 'k';
+	return 1 + (u32)fmt_u64(b + 1, i);
+}
+
+static u32
+mkfld(char *b, u64 i)
+{
+	b[0] = 'f';
 	return 1 + (u32)fmt_u64(b + 1, i);
 }
 
@@ -311,9 +322,267 @@ w_mixed(Job *j)
 	}
 }
 
+/* ---- containers -------------------------------------------------------
+ *
+ * The same total number of items as the plain workloads, arranged as
+ * keyspace/FIELDS maps of FIELDS fields each, so the two are comparable:
+ * what changes is the shape of the lookup, not how much is stored. */
+
+static void
+kkv_defaults(DbKkvOpt *o)
+{
+	memset(o, 0, sizeof(*o));
+	o->ttl = DB_FOREVER;
+	o->kttl = DB_FOREVER;
+	o->mode = SET_ANY;
+}
+
+static void
+q_defaults(DbQOpt *o, int right)
+{
+	memset(o, 0, sizeof(*o));
+	o->ttl = DB_FOREVER;
+	o->qttl = DB_FOREVER;
+	o->right = right;
+}
+
+static void
+fill_maps(void)
+{
+	u8 val[VAL_MAX];
+	char k[KEY_MAX], f[KEY_MAX];
+	DbKkvOpt o;
+	u64 i;
+	u32 j;
+
+	memset(val, 'v', valsize);
+	kkv_defaults(&o);
+	nmaps = keyspace / FIELDS;
+	if (!nmaps)
+		nmaps = 1;
+	for (i = 0; i < nmaps; i++)
+		for (j = 0; j < FIELDS; j++)
+			db_kkv_set(&db, k, mkkey(k, i), f, mkfld(f, j),
+			           val, valsize, &o, NULL, NULL);
+}
+
+static void
+fill_queues(void)
+{
+	u8 val[VAL_MAX];
+	char k[KEY_MAX];
+	DbQOpt o;
+	DbItem it;
+	u64 i;
+	u32 j, got;
+
+	memset(val, 'v', valsize);
+	q_defaults(&o, Q_RIGHT);
+	it.k = NULL;
+	it.kl = 0;
+	it.v = val;
+	it.vl = valsize;
+	it.ttl = DB_FOREVER;
+	nqueues = keyspace / QDEPTH;
+	if (nqueues < 16)
+		nqueues = 16;
+	for (i = 0; i < nqueues; i++)
+		for (j = 0; j < QDEPTH; j++)
+			db_q_push(&db, k, mkkey(k, i), &it, 1, &o, &got, NULL);
+}
+
+static int
+sink_fld(void *arg, const void *f, u32 fl, const void *v, u32 vl,
+         const DbMeta *m)
+{
+	u64 *n = arg;
+
+	(void)f; (void)fl; (void)v; (void)vl; (void)m;
+	(*n)++;
+	return 0;
+}
+
+static int
+sink_ent(void *arg, const void *v, u32 vl, const DbQMeta *e)
+{
+	u64 *n = arg;
+
+	(void)v; (void)vl; (void)e;
+	(*n)++;
+	return 0;
+}
+
+static void
+w_kkv_get(Job *j)
+{
+	u8 val[VAL_MAX];
+	char k[KEY_MAX], f[KEY_MAX];
+	DbMeta m;
+	u64 s = seed_of(j);
+	int i;
+
+	wait_go();
+	while (running()) {
+		for (i = 0; i < BATCH; i++) {
+			u64 r = rng_next(&s);
+			u32 kl = mkkey(k, (r >> 8) % nmaps);
+			u32 fl = mkfld(f, (r >> 40) % FIELDS);
+
+			if (db_kkv_get(&db, k, kl, f, fl, val, sizeof(val),
+			               &m) != DB_OK)
+				j->misses++;
+		}
+		j->ops += BATCH;
+	}
+}
+
+static void
+w_kkv_set(Job *j)
+{
+	u8 val[VAL_MAX];
+	char k[KEY_MAX], f[KEY_MAX];
+	DbKkvOpt o;
+	u64 s = seed_of(j);
+	int i;
+
+	memset(val, 'v', valsize);
+	kkv_defaults(&o);
+	wait_go();
+	while (running()) {
+		for (i = 0; i < BATCH; i++) {
+			u64 r = rng_next(&s);
+			u32 kl = mkkey(k, (r >> 8) % nmaps);
+			u32 fl = mkfld(f, (r >> 40) % FIELDS);
+
+			if (db_kkv_set(&db, k, kl, f, fl, val, valsize, &o,
+			               NULL, NULL) != DB_OK)
+				j->errors++;
+		}
+		j->ops += BATCH;
+	}
+}
+
+/* one request, every field of one map: what the shape is actually for */
+static void
+w_kkv_scan(Job *j)
+{
+	char k[KEY_MAX];
+	u64 s = seed_of(j), seen = 0;
+	int i;
+
+	wait_go();
+	while (running()) {
+		for (i = 0; i < BATCH; i++) {
+			u32 kl = mkkey(k, rng_next(&s) % nmaps);
+
+			if (db_kkv_scan(&db, k, kl, sink_fld, &seen, NULL)
+			    != DB_OK)
+				j->misses++;
+		}
+		j->ops += BATCH * FIELDS;
+	}
+	j->errors += seen & 0;
+}
+
+/* Build a map and throw it away.  The interesting part is that the
+ * throwing away is constant time: the sweeper takes it apart later. */
+static void
+w_kkv_churn(Job *j)
+{
+	u8 val[VAL_MAX];
+	char k[KEY_MAX], f[KEY_MAX];
+	DbKkvOpt o;
+	u64 s = seed_of(j);
+	int i;
+
+	memset(val, 'v', valsize);
+	kkv_defaults(&o);
+	wait_go();
+	while (running()) {
+		u32 kl = mkkey(k, rng_next(&s));
+
+		for (i = 0; i < FIELDS; i++)
+			if (db_kkv_set(&db, k, kl, f, mkfld(f, (u64)i), val,
+			               valsize, &o, NULL, NULL) != DB_OK)
+				j->errors++;
+		db_kkv_drop(&db, k, kl);
+		j->ops += FIELDS + 1;
+	}
+}
+
+static void
+w_q_cycle(Job *j)
+{
+	u8 val[VAL_MAX];
+	char k[KEY_MAX];
+	DbQOpt push, pop;
+	DbItem it;
+	u64 s = seed_of(j), seen = 0;
+	u32 got;
+	int i;
+
+	memset(val, 'v', valsize);
+	q_defaults(&push, Q_RIGHT);
+	q_defaults(&pop, Q_LEFT);
+	it.k = NULL;
+	it.kl = 0;
+	it.v = val;
+	it.vl = valsize;
+	it.ttl = DB_FOREVER;
+	wait_go();
+	while (running()) {
+		for (i = 0; i < BATCH; i++) {
+			u32 kl = mkkey(k, rng_next(&s) % nqueues);
+
+			if (db_q_push(&db, k, kl, &it, 1, &push, &got, NULL)
+			    != DB_OK)
+				j->errors++;
+			if (db_q_pop(&db, k, kl, 1, &pop, sink_ent, &seen,
+			             &got, NULL) != DB_OK)
+				j->misses++;
+		}
+		j->ops += BATCH * 2;
+	}
+}
+
+/* one pop of many entries, which is the only way to beat the round trip */
+static void
+w_q_drain(Job *j)
+{
+	u8 val[VAL_MAX];
+	char k[KEY_MAX];
+	DbQOpt push, pop;
+	DbItem it[64];
+	u64 s = seed_of(j), seen = 0;
+	u32 got, i;
+
+	memset(val, 'v', valsize);
+	q_defaults(&push, Q_RIGHT);
+	q_defaults(&pop, Q_LEFT);
+	for (i = 0; i < LEN(it); i++) {
+		it[i].k = NULL;
+		it[i].kl = 0;
+		it[i].v = val;
+		it[i].vl = valsize;
+		it[i].ttl = DB_FOREVER;
+	}
+	wait_go();
+	while (running()) {
+		u32 kl = mkkey(k, rng_next(&s) % nqueues);
+
+		if (db_q_push(&db, k, kl, it, (u32)LEN(it), &push, &got, NULL)
+		    != DB_OK)
+			j->errors++;
+		if (db_q_pop(&db, k, kl, (u32)LEN(it), &pop, sink_ent, &seen,
+		             &got, NULL) != DB_OK)
+			j->misses++;
+		j->ops += LEN(it) * 2;
+	}
+}
+
 /* ---- scenario driver -------------------------------------------------- */
 
-enum { PF_NONE, PF_KEYS, PF_FULL };
+enum { PF_NONE, PF_KEYS, PF_FULL, PF_MAPS, PF_QUEUES };
 
 typedef struct Scen {
 	const char *name;
@@ -355,6 +624,10 @@ run_scen(const Scen *s)
 			db_flush(&db);
 		if (s->prefill == PF_KEYS)
 			fill_keys();
+		else if (s->prefill == PF_MAPS)
+			fill_maps();
+		else if (s->prefill == PF_QUEUES)
+			fill_queues();
 		else if (s->prefill == PF_FULL)
 			filled = fill_arena();
 
@@ -418,7 +691,16 @@ static const Scen scens[] = {
 	{ "micro_get_mt",    w_get_hit, 0, PF_KEYS, 1 },
 	{ "micro_set_mt",    w_set_over, 0, PF_KEYS, 1 },
 	{ "micro_mixed_mt",  w_mixed,   0, PF_KEYS, 1 },
-	{ "micro_evict_mt",  w_set_new, 0, PF_FULL, 1 }
+	{ "micro_evict_mt",  w_set_new, 0, PF_FULL, 1 },
+	{ "micro_kkv_get",   w_kkv_get, 1, PF_MAPS, 1 },
+	{ "micro_kkv_set",   w_kkv_set, 1, PF_MAPS, 1 },
+	{ "micro_kkv_scan",  w_kkv_scan, 1, PF_MAPS, 1 },
+	{ "micro_kkv_churn", w_kkv_churn, 1, PF_NONE, 1 },
+	{ "micro_q_cycle",   w_q_cycle, 1, PF_QUEUES, 1 },
+	{ "micro_q_drain",   w_q_drain, 1, PF_QUEUES, 1 },
+	{ "micro_kkv_get_mt", w_kkv_get, 0, PF_MAPS, 1 },
+	{ "micro_kkv_set_mt", w_kkv_set, 0, PF_MAPS, 1 },
+	{ "micro_q_cycle_mt", w_q_cycle, 0, PF_QUEUES, 1 }
 };
 
 static void *

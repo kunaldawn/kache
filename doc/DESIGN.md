@@ -285,12 +285,184 @@ They are relaxed atomics rather than plain integers: a plain read in
 real machine would misbehave, and a relaxed load/store pair compiles to
 the same instructions while making the program well defined.
 
+Containers
+----------
+
+A key holds one of three things, named by a type byte in the record: a
+value, a nested map, or a queue.  The two container types keep a fixed
+size control block where a plain value would sit, and everything hanging
+off it - slot tables, field records, queue segments - is an ordinary
+arena block carrying the `BLK_SUB` flag.  Sub blocks are not in the
+index: they are reachable only from their container.
+
+That one decision is what makes the rest cheap.  A container lives
+entirely inside the shard its outer key hashes to, so the lock that
+covers the key covers everything in it, and a read, a write, an
+enumeration and a many field update are each atomic against every other
+operation on that key with no second level of synchronisation anywhere.
+A flattened `outer\0inner` key space gets none of that: the pieces of
+one map land in different shards, so there is no enumeration, no atomic
+multi field write, and no way to delete the map except by knowing every
+field's name.
+
+The price of that is a ceiling: a container cannot outgrow the arena of
+the one shard it lives in, which is the file divided by the shard count.
+Reaching it is a `507` and nothing else - the container is exactly as it
+was, and the other shards never heard about it.  Spreading one container
+across shards would buy a bigger ceiling and cost the property the whole
+design is built on, so the knob is `-S` instead.
+
+There is a second, smaller price.  Eviction grows a free run by
+swallowing the blocks in front of it, and it cannot swallow a sub block,
+because a sub block is not a key and cannot be evicted on its own.  So a
+shard densely packed with container data assembles a large contiguous
+run by evicting whole containers rather than by merging forwards, which
+takes more rounds to arrive at the same place.
+
+Inside the mapping a container refers to its blocks by a 32 bit *ref*:
+the block's offset from the start of its shard's arena, in grains,
+biased by one so zero stays the null reference.  An arena is at most 4
+GiB and blocks are 16 byte aligned, so 32 bits is more than enough,
+which halves the size of a slot table and of a segment header.
+
+A container's control block is a row of 64 bit counters and has to be 8
+byte aligned, so the key in front of it is padded up to the next
+multiple of eight.  The key still comes first, because the index
+compares against it without knowing what kind of key it is.
+
+The nested map
+--------------
+
+Open addressed with linear probing, like the shard index, but its slots
+are half the size: 8 bytes of 32 bit tag and 32 bit ref, eight to a cache
+line, so most lookups touch one line.  The tag is the *low* 32 bits of
+the field hash, not the high ones, and that is deliberate - the low bits
+are also the slot's home position, which is what backward shift deletion
+needs in order to know whether an entry may move.  A 32 bit tag still
+rejects a collision without dereferencing into the arena.
+
+Growing allocates a new table and rehashes, and the rehash reads the old
+slot array and nothing else: the tag carries the whole of the new
+position, so not one field record is touched.  Shrinking happens when a
+map falls to an eighth of its table, but never during an enumeration -
+an enumeration erases expired fields as it meets them, and the slot
+array must not move underneath it.
+
+A field is shaped like a record and validated the same way, with its own
+hash, expiry, CAS token and flags, plus a back reference to the map that
+owns it.  Field and map expiries are independent: either can outlive the
+other, and a map whose own TTL lapses takes its live fields with it.
+
+The queue
+---------
+
+A queue could have been a linked list of records - one allocator call,
+one index slot and a 56 byte record per message.  Instead entries live
+inside *segments*: an arena block holding a run of framed entries,
+filled from whichever end is being pushed.  One allocation feeds dozens
+of pushes, the bytes of a queue being drained stay contiguous, and the
+index never learns that the queue has more than one key in it.
+
+Each entry carries its frame length at both ends, so a pop from either
+side is a constant time step - the same boundary tag idea the arena
+allocator uses one level down.  Overhead is 32 bytes and a rounding to
+eight, against 56 plus an index slot plus an allocator call for the
+record per message version.
+
+Segments start at `CFG_QSEG_MIN` and double up to `CFG_QSEG_MAX`, so a
+queue of five messages does not pay for a queue of five million and a
+queue of five million does not allocate every few pushes.  A message too
+large for the ceiling gets a segment of its own.  An empty segment is
+freed unless it is small and the only one, which is what keeps a queue
+that hovers around empty from allocating on every message; because it is
+empty it can be re-aimed at either end for nothing.
+
+`qmove` is the only call in kache that holds two locks.  It takes them
+in address order, pins both records, builds the destination entry and
+only then takes the source one, so the message is in one queue or the
+other and never in neither - which is what makes it usable as the
+reliable queue primitive it looks like.
+
+Pinning
+-------
+
+An allocation inside a container may evict, and the one thing eviction
+must not take is the container being walked.  Sub blocks are never
+eviction candidates to begin with, so pinning the container's record
+covers the whole subtree hanging off it: the sampler skips a pinned
+slot, and the forward coalescing walk stops at one.  There are two pin
+slots per shard because `qmove` holds a source and a destination, and
+they may share a shard.
+
+In use blocks never move in this allocator, which is the invariant the
+whole scheme rests on: a pointer into a pinned container stays valid
+across an allocation that evicts half the shard around it.
+
+Deferred reclamation
+--------------------
+
+Deleting a map of a hundred thousand fields would otherwise be one
+caller's problem - a single request holding the shard lock while it
+walks a structure the size of the arena.  Instead the container leaves
+the index at once and joins a per shard graveyard, threaded through the
+control blocks of the dead containers themselves, and is taken apart a
+few blocks at a time by the requests that follow it and by a once a
+second housekeeping tick on each worker.  The tick takes the shard lock
+with a try and never waits for it: a shard that is busy is one whose own
+traffic is already sweeping it.
+
+A dead container is flagged `BLK_SUB`, which by then is exactly true of
+it - it is no longer in the index - and that is what keeps eviction and
+the forward coalescing walk from looking at it again.
+
+The memory is handed back late, not lost.  An allocation that cannot be
+satisfied sweeps, retries, drains the whole graveyard, and only then
+starts evicting things a client can still read, so a store under
+pressure never chooses eviction over reclamation.
+
+Recovering a container
+----------------------
+
+Recovery of plain records is a single forward walk of a self describing
+block chain.  Containers make it two sided: a block flagged `BLK_SUB`
+says it belongs to one, but not that the container still wants it - the
+pointer that did could have been half written.  So the walk runs three
+times.
+
+The first pass normalises the block chain, keeping every sound top level
+record and every sub block, and rebuilds the index from the records.
+The second walks out from each surviving container and validates what it
+claims to own: bounds, alignment, the owner back reference, the sizes,
+each field against its own stored hash, each queue segment's entry chain
+against its boundary tags and its own count.  Claiming is part of
+validating - a block already marked belongs to somebody else, so a stale
+pointer cannot make two containers share one field - and a container
+that fails any of it is simply unindexed and left unmarked.  The third
+pass lays the arena out again, keeping only what was marked.
+
+A map's probe runs are checked too, in one pass rather than by probing
+from every home: start at an empty slot and walk, and inside each run of
+occupied slots every home must lie between the run's start and the slot
+itself.  That is exactly the linear probing invariant, and a table that
+breaks it would answer a lookup with a miss for a field that is there.
+
+The guarantee is the one the plain records already had, extended: an
+unclean restart cannot produce a store that lies.  Either a container is
+intact with everything it points at, or it is gone.
+
+
 Things deliberately absent
 --------------------------
 
 *Key enumeration.*  Scanning a shard means holding its lock for the length
 of the scan, and a cache that can be scanned invites being used as a
-database.
+database.  Enumerating one nested map is a different thing and is
+supported: it is bounded by that map's size, which its owner chose.
+
+*Blocking pops.*  A `BLPOP` would have to park a connection on a queue,
+wake it from another worker's thread, and unpark it on a timeout, which
+is a scheduler inside the event loop for one call's benefit.  A consumer
+polls, or holds a connection open and pops a batch.
 
 *A binary protocol.*  HTTP costs a few hundred nanoseconds of parsing
 against a network round trip, and buys every client library, proxy and

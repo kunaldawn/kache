@@ -26,16 +26,45 @@ void alc_free(Map *m, Shard *s, u64 payoff, u64 *blkoff, u32 *blksize);
 /* usable bytes of an allocated payload */
 u32  alc_cap(const Map *m, u64 payoff);
 
+/* Reuse a block in place when it is a decent fit; a much larger block
+ * would pin memory the rest of the shard could use. */
+static inline int
+alc_fits(u32 cap, u32 need)
+{
+	return cap >= need && (cap <= 128 || need >= cap / 2);
+}
+
 /* recovery helpers: rewrite the arena block by block */
 void alc_reset_bins(Shard *s);
 void alc_place_free(Map *m, Shard *s, u64 off, u32 size, u32 prev);
-void alc_place_used(Map *m, Shard *s, u64 off, u32 size, u32 prev);
+void alc_place_used(Map *m, Shard *s, u64 off, u32 size, u32 prev, u32 flags);
 void alc_place_end(Map *m, Shard *s, u32 prev);
 
 static inline Blk *
 alc_blk(const Map *m, u64 blkoff)
 {
 	return (Blk *)(m->base + blkoff);
+}
+
+/* the block behind an allocated payload */
+static inline Blk *
+alc_of(const Map *m, u64 payoff)
+{
+	return alc_blk(m, payoff - ST_BLKHDR);
+}
+
+/* Flags ride in the low bits of the size field, which alignment leaves
+ * free.  Freeing rewrites size outright and so clears them all. */
+static inline void
+alc_mark(const Map *m, u64 payoff, u32 flags)
+{
+	alc_of(m, payoff)->size |= flags;
+}
+
+static inline void
+alc_unmark(const Map *m, u64 payoff, u32 flags)
+{
+	alc_of(m, payoff)->size &= ~flags;
 }
 
 #endif /* KACHE_ALLOC_H */

@@ -1,5 +1,6 @@
 /* kache - the mapping from request to store operation, and back to a
  * status code.  This is the only file that knows the HTTP contract. */
+#include <stdlib.h>
 #include <string.h>
 
 #include "config.h"
@@ -61,6 +62,7 @@ status_of(int rc)
 	case DB_ENOSPC: return 507;
 	case DB_E2BIG:  return 413;
 	case DB_ENUM:   return 409;
+	case DB_ETYPE:  return 409;
 	}
 	return 500;
 }
@@ -116,14 +118,18 @@ take_key(Str rest, Key *k)
 }
 
 /* ttl in seconds from the query or the header, 0 meaning "no expiry".
- * Returns 1 when the request carried one, 0 when it did not, -1 on junk. */
+ * Returns 1 when the request carried one, 0 when it did not, -1 on junk.
+ * The names are parameters because a container has two independent
+ * expiries: ttl / ttlms for the item, kttl / kttlms for the key it lives
+ * in.  Only the item one has a header spelling. */
 static int
-take_ttl(const Req *r, i64 dfl, i64 *out)
+take_ttl_of(const Req *r, const char *sec, const char *ms, Str hdr,
+            i64 dfl, i64 *out)
 {
 	i64 v;
 	int rc;
 
-	if ((rc = query_i64(r->query, "ttlms", &v)) == 0) {
+	if ((rc = query_i64(r->query, ms, &v)) == 0) {
 		if (v < 0)
 			return -1;
 		*out = v ? v : DB_FOREVER;
@@ -131,7 +137,7 @@ take_ttl(const Req *r, i64 dfl, i64 *out)
 	}
 	if (rc == -2)
 		return -1;
-	if ((rc = query_i64(r->query, "ttl", &v)) == 0) {
+	if ((rc = query_i64(r->query, sec, &v)) == 0) {
 		if (v < 0 || v > INT64_MAX / 1000)
 			return -1;
 		*out = v ? v * 1000 : DB_FOREVER;
@@ -139,8 +145,8 @@ take_ttl(const Req *r, i64 dfl, i64 *out)
 	}
 	if (rc == -2)
 		return -1;
-	if (r->xttl.n) {
-		if (parse_i64(r->xttl.p, r->xttl.n, &v) < 0 || v < 0 ||
+	if (hdr.n) {
+		if (parse_i64(hdr.p, hdr.n, &v) < 0 || v < 0 ||
 		    v > INT64_MAX / 1000)
 			return -1;
 		*out = v ? v * 1000 : DB_FOREVER;
@@ -148,6 +154,21 @@ take_ttl(const Req *r, i64 dfl, i64 *out)
 	}
 	*out = dfl;
 	return 0;
+}
+
+static int
+take_ttl(const Req *r, i64 dfl, i64 *out)
+{
+	return take_ttl_of(r, "ttl", "ttlms", r->xttl, dfl, out);
+}
+
+/* the container's own expiry, which no header spells */
+static int
+take_kttl(const Req *r, i64 dfl, i64 *out)
+{
+	Str none = { NULL, 0 };
+
+	return take_ttl_of(r, "kttl", "kttlms", none, dfl, out);
 }
 
 static int
@@ -406,7 +427,8 @@ static size_t
 collect(Ctx *c, Metric *mt, size_t cap)
 {
 	enum { REQ, HIT, MISS, SET, DEL, INCR, CAT, TOUCH, ERR,
-	       ACCEPT, CLOSE, CUR, BIN, BOUT };
+	       ACCEPT, CLOSE, CUR, BIN, BOUT,
+	       KKVR, KKVW, KKVD, QPUSH, QPOP };
 	u64 s[STATS_FIELDS];
 	DbStats d;
 	size_t n = 0;
@@ -440,6 +462,12 @@ collect(Ctx *c, Metric *mt, size_t cap)
 	M("connections_closed_total", "counter", s[CLOSE]);
 	M("bytes_in_total", "counter", s[BIN]);
 	M("bytes_out_total", "counter", s[BOUT]);
+	M("map_reads_total", "counter", s[KKVR]);
+	M("map_writes_total", "counter", s[KKVW]);
+	M("map_deletes_total", "counter", s[KKVD]);
+	M("queue_pushes_total", "counter", s[QPUSH]);
+	M("queue_pops_total", "counter", s[QPOP]);
+	M("reclaim_pending", "gauge", d.dead);
 #undef M
 	return n;
 }
@@ -447,7 +475,7 @@ collect(Ctx *c, Metric *mt, size_t cap)
 static void
 do_stats(Ctx *c, Buf *out, int ka, int prom)
 {
-	Metric mt[32];
+	Metric mt[40];
 	size_t n = collect(c, mt, LEN(mt)), i;
 	size_t mark = out->len;
 	Hdrs h;
@@ -498,16 +526,58 @@ static const char index_page[] =
 "  GET    /metrics             the same in prometheus form\n"
 "  GET    /health              liveness\n"
 "\n"
+"nested maps - the key holds fields, and both levels carry a ttl\n"
+"\n"
+"  GET    /kkv/<key>           dump every field, framed\n"
+"  GET    /kkv/<key>?f=<fld>   one field\n"
+"  PUT    /kkv/<key>?f=<fld>   store one field\n"
+"  POST   /kkv/<key>           set many fields at once, atomically\n"
+"  DELETE /kkv/<key>?f=<fld>   remove one field\n"
+"  DELETE /kkv/<key>           remove the whole map\n"
+"  POST   /kkvdel/<key>        remove many fields, framed names\n"
+"  POST   /kkvincr/<key>?f=    add ?by=N to a field\n"
+"  POST   /kkvdecr/<key>?f=    subtract ?by=N\n"
+"  POST   /kkvtouch/<key>[?f=] reset a field ttl, or the map's\n"
+"\n"
+"queues - a deque with a ttl on the queue and one on every message\n"
+"\n"
+"  POST   /q/<key>             push the body, ?side=r by default\n"
+"  POST   /qpush/<key>         push many messages, framed\n"
+"  POST   /qpop/<key>          pop ?n (default 1), ?side=l by default\n"
+"  GET    /q/<key>             the same without removing anything\n"
+"  POST   /qmove/<key>?dst=<k> pop one and push it, under both locks\n"
+"  POST   /qtrim/<key>?maxlen= keep at most that many\n"
+"  POST   /qtouch/<key>        reset the queue ttl\n"
+"  DELETE /q/<key>             remove the queue\n"
+"\n"
 "  ?ttl=<seconds>              0 means never expire\n"
 "  ?ttlms=<milliseconds>       finer grained ttl\n"
 "  ?flags=<u32>                opaque, returned in X-Kache-Flags\n"
 "  If-None-Match: *            store only if absent\n"
-"  If-Match: \"<etag>\"          store or delete only on that version\n";
+"  If-Match: \"<etag>\"          store or delete only on that version\n"
+"  ?kttl=<seconds>             the container's own ttl, not the item's\n"
+"  ?f=<field>                  percent encoded, so any bytes go\n"
+"  ?n=<count>                  how many to return; frames the answer\n"
+"\n"
+"frames are length prefixed, so names and values are binary safe:\n"
+"  map:   \"<fieldlen> <valuelen> [ttl]\\n\" <field> <value> \"\\n\"\n"
+"  queue: \"<valuelen> [ttl]\\n\" <value> \"\\n\"\n";
 
 /* ---- dispatch -------------------------------------------------------- */
 
 static void do_mget(Ctx *c, const Req *r, Buf *out, int ka, int del);
 static void do_mset(Ctx *c, const Req *r, Buf *out, int ka);
+static void do_kkv(Ctx *c, const Req *r, Buf *out, int ka, const Key *k);
+static void do_kkv_incr(Ctx *c, const Req *r, Buf *out, int ka, const Key *k,
+                        int sign);
+static void do_kkv_touch(Ctx *c, const Req *r, Buf *out, int ka, const Key *k);
+static void do_kkv_mdel(Ctx *c, const Req *r, Buf *out, int ka, const Key *k);
+static void do_q(Ctx *c, const Req *r, Buf *out, int ka, const Key *k);
+static void do_q_push(Ctx *c, const Req *r, Buf *out, int ka, const Key *k);
+static void do_q_pop(Ctx *c, const Req *r, Buf *out, int ka, const Key *k);
+static void do_q_move(Ctx *c, const Req *r, Buf *out, int ka, const Key *k);
+static void do_q_trim(Ctx *c, const Req *r, Buf *out, int ka, const Key *k);
+static void do_q_touch(Ctx *c, const Req *r, Buf *out, int ka, const Key *k);
 
 static int
 key_or_fail(Ctx *c, Buf *out, int ka, Str rest, Key *k)
@@ -553,8 +623,54 @@ route(Ctx *c, const Req *r, Buf *out, int *keepalive)
 		fail(c, out, 405, ka, "method not allowed");
 		return;
 	}
+	if (prefixed(r->path, "/kkv/", 5, &rest)) {
+		if (key_or_fail(c, out, ka, rest, &k) < 0)
+			return;
+		do_kkv(c, r, out, ka, &k);
+		return;
+	}
+	if (prefixed(r->path, "/q/", 3, &rest)) {
+		if (key_or_fail(c, out, ka, rest, &k) < 0)
+			return;
+		do_q(c, r, out, ka, &k);
+		return;
+	}
 	if (r->meth == M_POST) {
+		static const struct {
+			const char *pfx;
+			size_t      n;
+			void      (*fn)(Ctx *, const Req *, Buf *, int,
+			                const Key *);
+		} cont[] = {
+			{ "/kkvtouch/", 10, do_kkv_touch },
+			{ "/kkvdel/",    8, do_kkv_mdel },
+			{ "/qpush/",     7, do_q_push },
+			{ "/qpop/",      6, do_q_pop },
+			{ "/qmove/",     7, do_q_move },
+			{ "/qtrim/",     7, do_q_trim },
+			{ "/qtouch/",    8, do_q_touch }
+		};
 		int sign = 0, prepend = -1;
+		size_t ci;
+
+		for (ci = 0; ci < LEN(cont); ci++) {
+			if (!prefixed(r->path, cont[ci].pfx, cont[ci].n, &rest))
+				continue;
+			if (key_or_fail(c, out, ka, rest, &k) < 0)
+				return;
+			cont[ci].fn(c, r, out, ka, &k);
+			return;
+		}
+		if (prefixed(r->path, "/kkvincr/", 9, &rest))
+			sign = 1;
+		else if (prefixed(r->path, "/kkvdecr/", 9, &rest))
+			sign = -1;
+		if (sign) {
+			if (key_or_fail(c, out, ka, rest, &k) < 0)
+				return;
+			do_kkv_incr(c, r, out, ka, &k, sign);
+			return;
+		}
 
 		if (prefixed(r->path, "/incr/", 6, &rest))
 			sign = 1;
@@ -884,6 +1000,1124 @@ do_mset(Ctx *c, const Req *r, Buf *out, int ka)
 	hdrs_start(&h, stored == n ? 204 : 507, clk_date(), c->minimal_req);
 	hdrs_num(&h, "X-Kache-Count", (i64)n);
 	hdrs_num(&h, "X-Kache-Stored", (i64)stored);
+	hdrs_end(&h, 0, ka);
+	buf_put(out, h.b, h.n);
+}
+
+/* ---- containers -------------------------------------------------------
+ *
+ * Two shapes of key with a structure inside them, and one rule that
+ * makes the interface fall out: the path names the outer key, the query
+ * names everything inside it.  A field is `?f=`, an end of a queue is
+ * `?side=`, a count is `?n=`.  The alternative - a second path segment -
+ * cannot say where an outer key that contains a slash ends and the field
+ * begins, and keys here are bytes, not words.
+ *
+ * Expiry comes in two: `?ttl=` is the field's or the message's, `?kttl=`
+ * is the key's.  They are independent, so a session map can hold entries
+ * that lapse in a minute inside a key that lapses in a day, and neither
+ * has to know about the other.
+ *
+ * Anything carrying more than one item is framed by length rather than
+ * delimited, which is what keeps field names and values binary safe:
+ *
+ *   map:   "<fieldlen> <valuelen> [ttl]\n" <field> <value> "\n"
+ *   queue: "<valuelen> [ttl]\n" <value> "\n"
+ *
+ * The map frame is exactly what GET /kkv/<key> answers with, so a dump
+ * of one map is a legal body for a write to another. */
+
+/* 1 the request named a field, 0 it did not, -1 malformed, -2 too long */
+static int
+take_field(const Req *r, Key *f)
+{
+	Str v;
+	int rc;
+
+	if (query_get(r->query, "f", &v) < 0)
+		return 0;
+	if ((rc = take_key(v, f)) < 0)
+		return rc;
+	return 1;
+}
+
+static int
+field_or_fail(Ctx *c, Buf *out, int ka, const Req *r, Key *f)
+{
+	int rc = take_field(r, f);
+
+	if (rc == -2)
+		fail(c, out, 414, ka, "field too long");
+	else if (rc < 0)
+		fail(c, out, 400, ka, "bad field");
+	else if (rc == 0)
+		fail(c, out, 400, ka, "this endpoint needs ?f=<field>");
+	return rc == 1 ? 0 : -1;
+}
+
+/* which end of a queue a parameter names; -1 on anything else */
+static int
+take_side(const Req *r, const char *name, int dflt)
+{
+	Str v;
+
+	if (query_get(r->query, name, &v) < 0)
+		return dflt;
+	if (v.n == 1 && (*v.p == 'l' || *v.p == 'L'))
+		return Q_LEFT;
+	if (v.n == 1 && (*v.p == 'r' || *v.p == 'R'))
+		return Q_RIGHT;
+	if (v.n == 4 && !memcmp(v.p, "left", 4))
+		return Q_LEFT;
+	if (v.n == 5 && !memcmp(v.p, "right", 5))
+		return Q_RIGHT;
+	return -1;
+}
+
+/* how many items the request asked for; n absent means one, unframed */
+static int
+take_count(const Req *r, i64 dflt, i64 cap, i64 *out, int *given)
+{
+	Str v;
+
+	*given = query_get(r->query, "n", &v) == 0;
+	*out = dflt;
+	if (!*given)
+		return 0;
+	if (parse_i64(v.p, v.n, out) < 0 || *out < 0)
+		return -1;
+	if (*out > cap)
+		*out = cap;
+	return 0;
+}
+
+static void
+cont_headers(Hdrs *h, const DbCont *ci)
+{
+	hdrs_num(h, "X-Kache-Count", (i64)ci->count);
+	hdrs_num(h, "X-Kache-Bytes", (i64)ci->bytes);
+	hdrs_num(h, "X-Kache-Key-TTL",
+	         ci->ttl < 0 ? -1 : (i64)((ci->ttl + 999) / 1000));
+	hdrs_num(h, "X-Kache-Key-Version", (i64)ci->version);
+}
+
+static i64
+ttl_secs(i64 ms)
+{
+	return ms < 0 ? -1 : (ms + 999) / 1000;
+}
+
+/* the conditional headers, read the same way for a key and for a field */
+static int
+take_mode(Ctx *c, const Req *r, Buf *out, int ka, int *mode, u64 *cas)
+{
+	*mode = SET_ANY;
+	*cas = 0;
+	if (r->ifnone.n) {
+		if (r->ifnone.n != 1 || r->ifnone.p[0] != '*') {
+			fail(c, out, 400, ka,
+			     "only If-None-Match: * is supported");
+			return -1;
+		}
+		*mode = SET_ADD;
+	} else if (r->ifmatch.n) {
+		if (r->ifmatch.n == 1 && r->ifmatch.p[0] == '*') {
+			*mode = SET_REPLACE;
+		} else if (etag_value(r->ifmatch, cas) < 0) {
+			fail(c, out, 400, ka, "malformed If-Match");
+			return -1;
+		} else {
+			*mode = SET_CAS;
+		}
+	}
+	return 0;
+}
+
+static int
+kkv_opts(Ctx *c, const Req *r, Buf *out, int ka, DbKkvOpt *o)
+{
+	int has;
+
+	memset(o, 0, sizeof(*o));
+	o->mode = SET_ANY;
+	if (take_ttl(r, c->default_ttl, &o->ttl) < 0) {
+		fail(c, out, 400, ka, "bad ttl");
+		return -1;
+	}
+	if ((has = take_kttl(r, c->default_ttl, &o->kttl)) < 0) {
+		fail(c, out, 400, ka, "bad kttl");
+		return -1;
+	}
+	/* Only a request that said so moves the key's own expiry.  A write
+	 * to one field of a long lived map must not quietly restart the
+	 * clock on the map. */
+	o->set_kttl = has;
+	if (take_flags(r, &o->flags) < 0) {
+		fail(c, out, 400, ka, "bad flags");
+		return -1;
+	}
+	return 0;
+}
+
+/* ---- one field ------------------------------------------------------- */
+
+static void
+kkv_one_get(Ctx *c, const Req *r, Buf *out, int ka, const Key *k, const Key *f)
+{
+	size_t mark = out->len;
+	DbMeta m;
+	Hdrs h;
+	u8 nothing;
+	int rc = DB_OK, tries, head = (r->meth == M_HEAD);
+
+	if (head) {
+		rc = db_kkv_get(c->db, k->c, k->n, f->c, f->n, &nothing, 0, &m);
+		if (rc == DB_ESMALL)
+			rc = DB_OK;
+	} else {
+		for (tries = 0; tries < 4; tries++) {
+			u32 cap;
+
+			if (buf_room(out) < 512)
+				buf_grow(out, 512, 0);
+			cap = (u32)MIN(buf_room(out), (size_t)0xffffffffu);
+			rc = db_kkv_get(c->db, k->c, k->n, f->c, f->n,
+			                buf_tail(out), cap, &m);
+			if (rc != DB_ESMALL)
+				break;
+			buf_grow(out, m.vlen, 0);
+		}
+		if (rc == DB_OK)
+			out->len += m.vlen;
+	}
+	if (rc != DB_OK) {
+		st_inc(&c->st->misses);
+		if (rc == DB_ENOENT)
+			reply_text(c, out, 404, ka, "not found", 9);
+		else
+			fail_db(c, out, rc, ka);
+		return;
+	}
+	st_inc(&c->st->hits);
+	st_inc(&c->st->kkv_reads);
+	hdrs_start(&h, 200, clk_date(), c->minimal_req);
+	if (!c->minimal_req || head) {
+		hdrs_lit(&h, "Content-Type", CT_BIN);
+		meta_headers(&h, &m);
+	}
+	hdrs_end(&h, m.vlen, ka);
+	http_wrap(out, mark, &h);
+}
+
+static void
+kkv_one_put(Ctx *c, const Req *r, Buf *out, int ka, const Key *k, const Key *f)
+{
+	DbKkvOpt o;
+	DbMeta m;
+	DbCont ci;
+	Hdrs h;
+	int rc;
+
+	if (kkv_opts(c, r, out, ka, &o) < 0)
+		return;
+	if (take_mode(c, r, out, ka, &o.mode, &o.cas) < 0)
+		return;
+	memset(&ci, 0, sizeof(ci));
+	rc = db_kkv_set(c->db, k->c, k->n, f->c, f->n, r->body.p,
+	                (u32)r->body.n, &o, &m, &ci);
+	if (rc != DB_OK) {
+		if (rc == DB_ENOENT && o.mode != SET_ANY)
+			fail(c, out, 412, ka, "precondition failed");
+		else
+			fail_db(c, out, rc, ka);
+		return;
+	}
+	st_inc(&c->st->kkv_writes);
+	hdrs_start(&h, m.created ? 201 : 204, clk_date(), c->minimal_req);
+	meta_headers(&h, &m);
+	cont_headers(&h, &ci);
+	hdrs_end(&h, 0, ka);
+	buf_put(out, h.b, h.n);
+}
+
+static void
+kkv_one_del(Ctx *c, const Req *r, Buf *out, int ka, const Key *k, const Key *f)
+{
+	DbCont ci;
+	Hdrs h;
+	u64 cas = 0;
+	int use_cas = 0, rc;
+
+	if (r->ifmatch.n && !(r->ifmatch.n == 1 && r->ifmatch.p[0] == '*')) {
+		if (etag_value(r->ifmatch, &cas) < 0) {
+			fail(c, out, 400, ka, "malformed If-Match");
+			return;
+		}
+		use_cas = 1;
+	}
+	memset(&ci, 0, sizeof(ci));
+	rc = db_kkv_del(c->db, k->c, k->n, f->c, f->n, use_cas, cas, &ci);
+	if (rc != DB_OK) {
+		fail_db(c, out, rc, ka);
+		return;
+	}
+	st_inc(&c->st->kkv_dels);
+	hdrs_start(&h, 204, clk_date(), c->minimal_req);
+	cont_headers(&h, &ci);
+	hdrs_end(&h, 0, ka);
+	buf_put(out, h.b, h.n);
+}
+
+/* ---- the whole map --------------------------------------------------- */
+
+typedef struct Dump {
+	Buf   *out;
+	size_t mark;
+	size_t cap;      /* body bytes this response may reach */
+	u32    max;      /* items it may carry */
+	u32    n;
+	int    framed;
+	int    full;     /* stopped before the container ran out */
+	u64    id;       /* the single unframed item's metadata */
+	i64    ttl;
+	u32    flags;
+} Dump;
+
+static int
+dump_fld(void *arg, const void *f, u32 fl, const void *v, u32 vl,
+         const DbMeta *m)
+{
+	Dump *d = arg;
+	char pre[80];
+	size_t pn;
+
+	if (d->n >= d->max || d->out->len - d->mark >= d->cap) {
+		d->full = 1;
+		return 1;
+	}
+	pn = fmt_u64(pre, fl);
+	pre[pn++] = ' ';
+	pn += fmt_u64(pre + pn, vl);
+	pre[pn++] = ' ';
+	pn += fmt_i64(pre + pn, ttl_secs(m->ttl));
+	pre[pn++] = '\n';
+	buf_put(d->out, pre, pn);
+	buf_put(d->out, f, fl);
+	buf_put(d->out, v, vl);
+	buf_putc(d->out, '\n');
+	d->n++;
+	return 0;
+}
+
+static void
+kkv_dump(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
+{
+	size_t mark = out->len;
+	DbCont ci;
+	Dump d;
+	Hdrs h;
+	i64 want;
+	int rc, given;
+
+	if (take_count(r, CFG_CONT_BATCH_MAX, CFG_CONT_BATCH_MAX, &want,
+	               &given) < 0) {
+		fail(c, out, 400, ka, "bad n");
+		return;
+	}
+	memset(&ci, 0, sizeof(ci));
+	memset(&d, 0, sizeof(d));
+	d.out = out;
+	d.mark = mark;
+	d.cap = CFG_CONT_DUMP_MAX;
+	d.max = (u32)want;
+	/* ?n=0 asks for the counters alone, which costs one lookup instead
+	 * of a walk of the whole map */
+	if (want == 0)
+		rc = db_kkv_info(c->db, k->c, k->n, &ci);
+	else
+		rc = db_kkv_scan(c->db, k->c, k->n, dump_fld, &d, &ci);
+	if (rc != DB_OK) {
+		out->len = mark;
+		st_inc(&c->st->misses);
+		if (rc == DB_ENOENT)
+			reply_text(c, out, 404, ka, "not found", 9);
+		else
+			fail_db(c, out, rc, ka);
+		return;
+	}
+	st_inc(&c->st->hits);
+	st_inc(&c->st->kkv_reads);
+	hdrs_start(&h, 200, clk_date(), c->minimal_req);
+	hdrs_lit(&h, "Content-Type", CT_BIN);
+	cont_headers(&h, &ci);
+	hdrs_num(&h, "X-Kache-Returned", (i64)d.n);
+	if (d.full)
+		hdrs_lit(&h, "X-Kache-Truncated", "1");
+	hdrs_end(&h, out->len - mark, ka);
+	http_wrap(out, mark, &h);
+	no_body(out, mark, &h, c->head);
+}
+
+static void
+kkv_drop(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
+{
+	int rc = db_kkv_drop(c->db, k->c, k->n);
+
+	if (rc != DB_OK) {
+		fail_db(c, out, rc, ka);
+		return;
+	}
+	st_inc(&c->st->kkv_dels);
+	http_simple(out, 204, clk_date(), ka, c->minimal_req);
+}
+
+/* "<fieldlen> <valuelen> [ttl]\n" then that many raw bytes of each, and
+ * an optional newline.  1 a record, 0 the end of the body, -1 malformed. */
+static int
+kkv_frame(const char **pp, const char *end, i64 dflt, DbItem *it,
+          const char **why)
+{
+	Str line, rest, f;
+	const char *p;
+	u64 fl, vl;
+	i64 ttl = dflt;
+
+	do {
+		if (!batch_line(pp, end, &line))
+			return 0;
+	} while (!line.n);
+	rest = line;
+	if (!batch_field(&rest, &f) || parse_u64(f.p, f.n, &fl) < 0 || !fl ||
+	    fl > 0xffffffffull) {
+		*why = "bad field length";
+		return -1;
+	}
+	if (!batch_field(&rest, &f) || parse_u64(f.p, f.n, &vl) < 0 ||
+	    vl > 0xffffffffull) {
+		*why = "bad value length";
+		return -1;
+	}
+	if (batch_field(&rest, &f)) {
+		i64 t;
+
+		if (parse_i64(f.p, f.n, &t) < 0 || t > INT64_MAX / 1000) {
+			*why = "bad ttl";
+			return -1;
+		}
+		/* 0 and -1 both mean no expiry, so what GET /kkv/<key>
+		 * answers with is a legal body for a write */
+		ttl = t > 0 ? t * 1000 : DB_FOREVER;
+	}
+	p = *pp;
+	if ((u64)(end - p) < fl + vl) {
+		*why = "record shorter than its declared lengths";
+		return -1;
+	}
+	if (it) {
+		it->k = p;
+		it->kl = (u32)fl;
+		it->v = p + fl;
+		it->vl = (u32)vl;
+		it->ttl = ttl;
+	}
+	p += fl + vl;
+	if (p < end && *p == '\r')
+		p++;
+	if (p < end && *p == '\n')
+		p++;
+	*pp = p;
+	return 1;
+}
+
+/* "<len>\n" then that many raw bytes: a bare name, for a batch delete */
+static int
+name_frame(const char **pp, const char *end, DbItem *it, const char **why)
+{
+	Str line, rest, f;
+	const char *p;
+	u64 nl;
+
+	do {
+		if (!batch_line(pp, end, &line))
+			return 0;
+	} while (!line.n);
+	rest = line;
+	if (!batch_field(&rest, &f) || parse_u64(f.p, f.n, &nl) < 0 || !nl ||
+	    nl > 0xffffffffull) {
+		*why = "bad field length";
+		return -1;
+	}
+	p = *pp;
+	if ((u64)(end - p) < nl) {
+		*why = "name shorter than its declared length";
+		return -1;
+	}
+	if (it) {
+		it->k = p;
+		it->kl = (u32)nl;
+		it->v = NULL;
+		it->vl = 0;
+		it->ttl = DB_FOREVER;
+	}
+	p += nl;
+	if (p < end && *p == '\r')
+		p++;
+	if (p < end && *p == '\n')
+		p++;
+	*pp = p;
+	return 1;
+}
+
+/* Count the records first, so a malformed batch is rejected without
+ * touching the store, and so the item array is sized exactly once. */
+static int
+frame_count(const char *p, const char *end, i64 dflt, int names,
+            u32 *out, const char **why, int *toomany)
+{
+	u32 n = 0;
+	int rc;
+
+	*toomany = 0;
+	for (;;) {
+		rc = names ? name_frame(&p, end, NULL, why)
+		           : kkv_frame(&p, end, dflt, NULL, why);
+		if (rc != 1)
+			break;
+		if (++n > CFG_CONT_BATCH_MAX) {
+			*why = "too many items in one batch";
+			*toomany = 1;
+			return -1;
+		}
+	}
+	if (rc < 0)
+		return -1;
+	*out = n;
+	return 0;
+}
+
+static void
+kkv_mset(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
+{
+	const char *p, *end = r->body.p + r->body.n;
+	const char *why = "malformed batch";
+	DbKkvOpt o;
+	DbCont ci;
+	DbItem stack[16], *it;
+	Hdrs h;
+	u32 n = 0, i, stored = 0;
+	int rc, toomany;
+
+	if (kkv_opts(c, r, out, ka, &o) < 0)
+		return;
+	if (frame_count(r->body.p, end, o.ttl, 0, &n, &why, &toomany) < 0) {
+		fail(c, out, toomany ? 413 : 400, ka, why);
+		return;
+	}
+	it = n <= LEN(stack) ? stack : emalloc((size_t)n * sizeof(*it));
+	p = r->body.p;
+	for (i = 0; i < n; i++)
+		if (kkv_frame(&p, end, o.ttl, &it[i], &why) != 1)
+			break;
+	memset(&ci, 0, sizeof(ci));
+	rc = db_kkv_mset(c->db, k->c, k->n, it, i, &o, &stored, &ci);
+	if (it != stack)
+		free(it);
+	if (rc != DB_OK && rc != DB_ENOSPC) {
+		fail_db(c, out, rc, ka);
+		return;
+	}
+	st_add(&c->st->kkv_writes, stored);
+	if (stored != n)
+		st_inc(&c->st->errors);
+	hdrs_start(&h, stored == n ? 204 : 507, clk_date(), c->minimal_req);
+	cont_headers(&h, &ci);
+	hdrs_num(&h, "X-Kache-Stored", (i64)stored);
+	hdrs_end(&h, 0, ka);
+	buf_put(out, h.b, h.n);
+}
+
+static void
+do_kkv_mdel(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
+{
+	const char *p, *end = r->body.p + r->body.n;
+	const char *why = "malformed batch";
+	DbCont ci;
+	DbItem stack[16], *it;
+	Hdrs h;
+	u32 n = 0, i, removed = 0;
+	int rc, toomany;
+
+	if (frame_count(r->body.p, end, DB_FOREVER, 1, &n, &why, &toomany) < 0) {
+		fail(c, out, toomany ? 413 : 400, ka, why);
+		return;
+	}
+	it = n <= LEN(stack) ? stack : emalloc((size_t)n * sizeof(*it));
+	p = r->body.p;
+	for (i = 0; i < n; i++)
+		if (name_frame(&p, end, &it[i], &why) != 1)
+			break;
+	memset(&ci, 0, sizeof(ci));
+	rc = db_kkv_mdel(c->db, k->c, k->n, it, i, &removed, &ci);
+	if (it != stack)
+		free(it);
+	if (rc != DB_OK) {
+		fail_db(c, out, rc, ka);
+		return;
+	}
+	st_add(&c->st->kkv_dels, removed);
+	hdrs_start(&h, 204, clk_date(), c->minimal_req);
+	cont_headers(&h, &ci);
+	hdrs_num(&h, "X-Kache-Removed", (i64)removed);
+	hdrs_end(&h, 0, ka);
+	buf_put(out, h.b, h.n);
+}
+
+static void
+do_kkv(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
+{
+	Key f;
+	int has = take_field(r, &f);
+
+	if (has == -2) {
+		fail(c, out, 414, ka, "field too long");
+		return;
+	}
+	if (has < 0) {
+		fail(c, out, 400, ka, "bad field");
+		return;
+	}
+	switch (r->meth) {
+	case M_GET:
+	case M_HEAD:
+		if (has)
+			kkv_one_get(c, r, out, ka, k, &f);
+		else
+			kkv_dump(c, r, out, ka, k);
+		return;
+	case M_PUT:
+	case M_POST:
+		if (has)
+			kkv_one_put(c, r, out, ka, k, &f);
+		else
+			kkv_mset(c, r, out, ka, k);
+		return;
+	case M_DELETE:
+		if (has)
+			kkv_one_del(c, r, out, ka, k, &f);
+		else
+			kkv_drop(c, r, out, ka, k);
+		return;
+	}
+	fail(c, out, 405, ka, "method not allowed");
+}
+
+static void
+do_kkv_incr(Ctx *c, const Req *r, Buf *out, int ka, const Key *k, int sign)
+{
+	size_t mark = out->len;
+	DbKkvOpt o;
+	DbMeta m;
+	DbCont ci;
+	Hdrs h;
+	Key f;
+	i64 delta = 1, init = 0, result;
+	int rc;
+
+	if (field_or_fail(c, out, ka, r, &f) < 0)
+		return;
+	if (kkv_opts(c, r, out, ka, &o) < 0)
+		return;
+	if (query_i64(r->query, "by", &delta) == -2) {
+		fail(c, out, 400, ka, "bad by");
+		return;
+	}
+	if (query_i64(r->query, "init", &init) == -2) {
+		fail(c, out, 400, ka, "bad init");
+		return;
+	}
+	if (sign < 0) {
+		if (delta == INT64_MIN) {
+			fail(c, out, 409, ka, "delta out of range");
+			return;
+		}
+		delta = -delta;
+	}
+	/* no ttl of its own means the field keeps the one it has */
+	{
+		i64 unused;
+
+		if (take_ttl(r, c->default_ttl, &unused) == 0)
+			o.mode |= SET_KEEPTTL;
+	}
+	memset(&ci, 0, sizeof(ci));
+	rc = db_kkv_incr(c->db, k->c, k->n, f.c, f.n, delta, init, &o,
+	                 &result, &m, &ci);
+	if (rc != DB_OK) {
+		fail_db(c, out, rc, ka);
+		return;
+	}
+	st_inc(&c->st->incrs);
+	st_inc(&c->st->kkv_writes);
+	buf_puti(out, result);
+	hdrs_start(&h, 200, clk_date(), c->minimal_req);
+	hdrs_lit(&h, "Content-Type", CT_TXT);
+	meta_headers(&h, &m);
+	cont_headers(&h, &ci);
+	hdrs_end(&h, out->len - mark, ka);
+	http_wrap(out, mark, &h);
+}
+
+static void
+do_kkv_touch(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
+{
+	DbMeta m;
+	DbCont ci;
+	Hdrs h;
+	Key f;
+	i64 ttl;
+	int has = take_field(r, &f), rc;
+
+	if (has == -2) {
+		fail(c, out, 414, ka, "field too long");
+		return;
+	}
+	if (has < 0) {
+		fail(c, out, 400, ka, "bad field");
+		return;
+	}
+	if (take_ttl(r, c->default_ttl, &ttl) < 0) {
+		fail(c, out, 400, ka, "bad ttl");
+		return;
+	}
+	memset(&m, 0, sizeof(m));
+	memset(&ci, 0, sizeof(ci));
+	rc = db_kkv_touch(c->db, k->c, k->n, has ? f.c : NULL, has ? f.n : 0,
+	                  ttl, &m, &ci);
+	if (rc != DB_OK) {
+		fail_db(c, out, rc, ka);
+		return;
+	}
+	st_inc(&c->st->touches);
+	hdrs_start(&h, 204, clk_date(), c->minimal_req);
+	if (has)
+		meta_headers(&h, &m);
+	cont_headers(&h, &ci);
+	hdrs_end(&h, 0, ka);
+	buf_put(out, h.b, h.n);
+}
+
+/* ---- queues ----------------------------------------------------------- */
+
+static int
+q_opts(Ctx *c, const Req *r, Buf *out, int ka, DbQOpt *o, int dfl_side)
+{
+	i64 v;
+	int rc;
+
+	memset(o, 0, sizeof(*o));
+	if ((rc = take_ttl(r, c->default_ttl, &o->ttl)) < 0) {
+		fail(c, out, 400, ka, "bad ttl");
+		return -1;
+	}
+	o->set_ttl = rc;
+	if ((rc = take_kttl(r, c->default_ttl, &o->qttl)) < 0) {
+		fail(c, out, 400, ka, "bad kttl");
+		return -1;
+	}
+	o->set_qttl = rc;
+	if (take_flags(r, &o->flags) < 0) {
+		fail(c, out, 400, ka, "bad flags");
+		return -1;
+	}
+	rc = query_i64(r->query, "maxlen", &v);
+	if (rc == -2 || (rc == 0 && v < 0)) {
+		fail(c, out, 400, ka, "bad maxlen");
+		return -1;
+	}
+	o->maxlen = rc == 0 ? (u64)v : 0;
+	if ((o->right = take_side(r, "side", dfl_side)) < 0) {
+		fail(c, out, 400, ka, "side must be l or r");
+		return -1;
+	}
+	return 0;
+}
+
+/* One entry out.  A request that asked for a count gets frames; one that
+ * did not asked for a single message and gets its bytes, with the
+ * metadata in headers - which is what a worker taking one job wants, and
+ * what curl can use without a parser. */
+static int
+dump_ent(void *arg, const void *v, u32 vl, const DbQMeta *e)
+{
+	Dump *d = arg;
+	char pre[80];
+	size_t pn;
+
+	if (d->n >= d->max || d->out->len - d->mark >= d->cap) {
+		d->full = 1;
+		return 1;
+	}
+	if (d->framed) {
+		pn = fmt_u64(pre, vl);
+		pre[pn++] = ' ';
+		pn += fmt_i64(pre + pn, ttl_secs(e->ttl));
+		pre[pn++] = ' ';
+		pn += fmt_u64(pre + pn, e->id);
+		pre[pn++] = '\n';
+		buf_put(d->out, pre, pn);
+		buf_put(d->out, v, vl);
+		buf_putc(d->out, '\n');
+	} else {
+		buf_put(d->out, v, vl);
+		d->id = e->id;
+		d->ttl = e->ttl;
+		d->flags = e->flags;
+	}
+	d->n++;
+	return 0;
+}
+
+static void
+q_out(Ctx *c, Buf *out, int ka, size_t mark, const Dump *d, const DbCont *ci)
+{
+	Hdrs h;
+
+	hdrs_start(&h, 200, clk_date(), c->minimal_req);
+	hdrs_lit(&h, "Content-Type", CT_BIN);
+	cont_headers(&h, ci);
+	hdrs_num(&h, "X-Kache-Returned", (i64)d->n);
+	if (!d->framed) {
+		hdrs_num(&h, "X-Kache-Id", (i64)d->id);
+		hdrs_num(&h, "X-Kache-TTL", ttl_secs(d->ttl));
+		hdrs_num(&h, "X-Kache-Flags", (i64)d->flags);
+	}
+	if (d->full)
+		hdrs_lit(&h, "X-Kache-Truncated", "1");
+	hdrs_end(&h, out->len - mark, ka);
+	http_wrap(out, mark, &h);
+	no_body(out, mark, &h, c->head);
+}
+
+/* peek and pop differ in one flag and in which counter they bump */
+static void
+q_read(Ctx *c, const Req *r, Buf *out, int ka, const Key *k, int take)
+{
+	size_t mark = out->len;
+	DbQOpt o;
+	DbCont ci;
+	Dump d;
+	i64 want;
+	u32 got = 0;
+	int rc, given;
+
+	if (q_opts(c, r, out, ka, &o, Q_LEFT) < 0)
+		return;
+	if (take_count(r, 1, CFG_QPOP_MAX, &want, &given) < 0) {
+		fail(c, out, 400, ka, "bad n");
+		return;
+	}
+	memset(&ci, 0, sizeof(ci));
+	memset(&d, 0, sizeof(d));
+	d.out = out;
+	d.mark = mark;
+	d.cap = CFG_CONT_DUMP_MAX;
+	d.max = (u32)want;
+	d.framed = given;
+	if (take)
+		rc = db_q_pop(c->db, k->c, k->n, (u32)want, &o, dump_ent, &d,
+		              &got, &ci);
+	else
+		rc = db_q_peek(c->db, k->c, k->n, (u32)want, &o, dump_ent, &d,
+		               &got, &ci);
+	if (rc == DB_ENOENT || (rc == DB_OK && d.n == 0)) {
+		/* A queue that is empty and a queue that was never there
+		 * answer alike: there is nothing to hand over either way,
+		 * and a drained queue stops existing. */
+		out->len = mark;
+		st_inc(&c->st->misses);
+		http_simple(out, 204, clk_date(), ka, c->minimal_req);
+		return;
+	}
+	if (rc != DB_OK) {
+		out->len = mark;
+		fail_db(c, out, rc, ka);
+		return;
+	}
+	st_inc(&c->st->hits);
+	if (take)
+		st_add(&c->st->q_pops, d.n);
+	q_out(c, out, ka, mark, &d, &ci);
+}
+
+static void
+do_q_pop(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
+{
+	q_read(c, r, out, ka, k, 1);
+}
+
+/* "<valuelen> [ttl]\n" then that many raw bytes and an optional newline */
+static int
+q_frame(const char **pp, const char *end, i64 dflt, DbItem *it,
+        const char **why)
+{
+	Str line, rest, f;
+	const char *p;
+	u64 vl;
+	i64 ttl = dflt;
+
+	do {
+		if (!batch_line(pp, end, &line))
+			return 0;
+	} while (!line.n);
+	rest = line;
+	if (!batch_field(&rest, &f) || parse_u64(f.p, f.n, &vl) < 0 ||
+	    vl > 0xffffffffull) {
+		*why = "bad value length";
+		return -1;
+	}
+	if (batch_field(&rest, &f)) {
+		i64 t;
+
+		if (parse_i64(f.p, f.n, &t) < 0 || t > INT64_MAX / 1000) {
+			*why = "bad ttl";
+			return -1;
+		}
+		ttl = t > 0 ? t * 1000 : DB_FOREVER;
+	}
+	p = *pp;
+	if ((u64)(end - p) < vl) {
+		*why = "message shorter than its declared length";
+		return -1;
+	}
+	if (it) {
+		it->k = NULL;
+		it->kl = 0;
+		it->v = p;
+		it->vl = (u32)vl;
+		it->ttl = ttl;
+	}
+	p += vl;
+	if (p < end && *p == '\r')
+		p++;
+	if (p < end && *p == '\n')
+		p++;
+	*pp = p;
+	return 1;
+}
+
+static void
+q_pushed(Ctx *c, Buf *out, int ka, const DbCont *ci, u32 stored, u32 n)
+{
+	Hdrs h;
+
+	st_add(&c->st->q_pushes, stored);
+	if (stored != n)
+		st_inc(&c->st->errors);
+	hdrs_start(&h, stored == n ? (ci->created ? 201 : 204) : 507,
+	           clk_date(), c->minimal_req);
+	cont_headers(&h, ci);
+	hdrs_num(&h, "X-Kache-Stored", (i64)stored);
+	hdrs_num(&h, "X-Kache-Id", (i64)ci->seq);
+	hdrs_end(&h, 0, ka);
+	buf_put(out, h.b, h.n);
+}
+
+static void
+q_push_one(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
+{
+	DbQOpt o;
+	DbCont ci;
+	DbItem it;
+	u32 stored = 0;
+	int rc;
+
+	if (q_opts(c, r, out, ka, &o, Q_RIGHT) < 0)
+		return;
+	it.k = NULL;
+	it.kl = 0;
+	it.v = r->body.p;
+	it.vl = (u32)r->body.n;
+	it.ttl = o.ttl;
+	memset(&ci, 0, sizeof(ci));
+	rc = db_q_push(c->db, k->c, k->n, &it, 1, &o, &stored, &ci);
+	if (rc != DB_OK && rc != DB_ENOSPC) {
+		fail_db(c, out, rc, ka);
+		return;
+	}
+	q_pushed(c, out, ka, &ci, stored, 1);
+}
+
+static void
+do_q_push(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
+{
+	const char *p, *end = r->body.p + r->body.n;
+	const char *why = "malformed batch";
+	DbQOpt o;
+	DbCont ci;
+	DbItem stack[16], *it;
+	u32 n = 0, i, stored = 0;
+	int rc;
+
+	if (q_opts(c, r, out, ka, &o, Q_RIGHT) < 0)
+		return;
+	p = r->body.p;
+	for (;;) {
+		rc = q_frame(&p, end, o.ttl, NULL, &why);
+		if (rc != 1)
+			break;
+		if (++n > CFG_CONT_BATCH_MAX) {
+			why = "too many messages in one batch";
+			rc = -1;
+			break;
+		}
+	}
+	if (rc < 0) {
+		fail(c, out, n > CFG_CONT_BATCH_MAX ? 413 : 400, ka, why);
+		return;
+	}
+	it = n <= LEN(stack) ? stack : emalloc((size_t)n * sizeof(*it));
+	p = r->body.p;
+	for (i = 0; i < n; i++)
+		if (q_frame(&p, end, o.ttl, &it[i], &why) != 1)
+			break;
+	memset(&ci, 0, sizeof(ci));
+	rc = db_q_push(c->db, k->c, k->n, it, i, &o, &stored, &ci);
+	if (it != stack)
+		free(it);
+	if (rc != DB_OK && rc != DB_ENOSPC) {
+		fail_db(c, out, rc, ka);
+		return;
+	}
+	q_pushed(c, out, ka, &ci, stored, n);
+}
+
+static void
+q_drop(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
+{
+	int rc = db_q_drop(c->db, k->c, k->n);
+
+	if (rc != DB_OK) {
+		fail_db(c, out, rc, ka);
+		return;
+	}
+	st_inc(&c->st->dels);
+	http_simple(out, 204, clk_date(), ka, c->minimal_req);
+}
+
+static void
+do_q(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
+{
+	switch (r->meth) {
+	case M_GET:
+	case M_HEAD:   q_read(c, r, out, ka, k, 0); return;
+	case M_PUT:
+	case M_POST:   q_push_one(c, r, out, ka, k); return;
+	case M_DELETE: q_drop(c, r, out, ka, k); return;
+	}
+	fail(c, out, 405, ka, "method not allowed");
+}
+
+static void
+do_q_move(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
+{
+	size_t mark = out->len;
+	DbQOpt o;
+	DbCont ci;
+	Dump d;
+	Key dst;
+	Str v;
+	int from, to, rc;
+
+	if (q_opts(c, r, out, ka, &o, Q_LEFT) < 0)
+		return;
+	if (query_get(r->query, "dst", &v) < 0) {
+		fail(c, out, 400, ka, "qmove needs ?dst=<key>");
+		return;
+	}
+	if ((rc = take_key(v, &dst)) < 0) {
+		fail(c, out, rc == -2 ? 414 : 400, ka, "bad destination key");
+		return;
+	}
+	if ((from = take_side(r, "from", Q_LEFT)) < 0 ||
+	    (to = take_side(r, "to", Q_RIGHT)) < 0) {
+		fail(c, out, 400, ka, "from and to must be l or r");
+		return;
+	}
+	memset(&ci, 0, sizeof(ci));
+	memset(&d, 0, sizeof(d));
+	d.out = out;
+	d.mark = mark;
+	d.cap = CFG_CONT_DUMP_MAX;
+	d.max = 1;
+	rc = db_q_move(c->db, k->c, k->n, dst.c, dst.n, from, to, &o,
+	               dump_ent, &d, &ci);
+	if (rc == DB_ENOENT) {
+		out->len = mark;
+		st_inc(&c->st->misses);
+		http_simple(out, 204, clk_date(), ka, c->minimal_req);
+		return;
+	}
+	if (rc != DB_OK) {
+		out->len = mark;
+		fail_db(c, out, rc, ka);
+		return;
+	}
+	st_inc(&c->st->q_pops);
+	st_inc(&c->st->q_pushes);
+	q_out(c, out, ka, mark, &d, &ci);
+}
+
+static void
+do_q_trim(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
+{
+	DbCont ci;
+	Hdrs h;
+	i64 maxlen;
+	u64 removed = 0;
+	int side, rc;
+
+	if (query_i64(r->query, "maxlen", &maxlen) != 0 || maxlen < 0) {
+		fail(c, out, 400, ka, "qtrim needs ?maxlen=<n>");
+		return;
+	}
+	if ((side = take_side(r, "side", Q_LEFT)) < 0) {
+		fail(c, out, 400, ka, "side must be l or r");
+		return;
+	}
+	memset(&ci, 0, sizeof(ci));
+	rc = db_q_trim(c->db, k->c, k->n, (u64)maxlen, side, &removed, &ci);
+	if (rc != DB_OK) {
+		fail_db(c, out, rc, ka);
+		return;
+	}
+	st_add(&c->st->dels, removed);
+	hdrs_start(&h, 204, clk_date(), c->minimal_req);
+	cont_headers(&h, &ci);
+	hdrs_num(&h, "X-Kache-Removed", (i64)removed);
+	hdrs_end(&h, 0, ka);
+	buf_put(out, h.b, h.n);
+}
+
+static void
+do_q_touch(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
+{
+	DbCont ci;
+	Hdrs h;
+	i64 ttl;
+	int rc;
+
+	if (take_ttl(r, c->default_ttl, &ttl) < 0) {
+		fail(c, out, 400, ka, "bad ttl");
+		return;
+	}
+	memset(&ci, 0, sizeof(ci));
+	if ((rc = db_q_touch(c->db, k->c, k->n, ttl, &ci)) != DB_OK) {
+		fail_db(c, out, rc, ka);
+		return;
+	}
+	st_inc(&c->st->touches);
+	hdrs_start(&h, 204, clk_date(), c->minimal_req);
+	cont_headers(&h, &ci);
 	hdrs_end(&h, 0, ka);
 	buf_put(out, h.b, h.n);
 }

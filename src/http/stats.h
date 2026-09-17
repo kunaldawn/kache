@@ -29,10 +29,15 @@ typedef struct Stats {
 	Counter current;
 	Counter bytes_in;
 	Counter bytes_out;
-	u8      pad[128 - 14 * 8];
+	Counter kkv_reads;
+	Counter kkv_writes;
+	Counter kkv_dels;
+	Counter q_pushes;
+	Counter q_pops;
+	u8      pad[192 - 19 * 8];
 } Stats;
 
-_Static_assert(sizeof(Stats) == 128, "stats must stay two cache lines");
+_Static_assert(sizeof(Stats) == 192, "stats must stay three cache lines");
 
 /* Single writer, so a relaxed load and store is enough; no read/modify/
  * write instruction, no contention with the other workers. */
@@ -68,6 +73,6 @@ Stats *stats_of(unsigned i);
 /* sum every worker's counters into a plain snapshot */
 void   stats_sum(u64 *out, unsigned n);
 
-#define STATS_FIELDS 14
+#define STATS_FIELDS 19
 
 #endif /* KACHE_STATS_H */

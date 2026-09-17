@@ -10,7 +10,7 @@ static unsigned count;
 void
 stats_init(unsigned n)
 {
-	if (posix_memalign((void **)&all, 128, (size_t)n * sizeof(Stats)) != 0)
+	if (posix_memalign((void **)&all, 64, (size_t)n * sizeof(Stats)) != 0)
 		die("out of memory");
 	memset(all, 0, (size_t)n * sizeof(Stats));
 	count = n;

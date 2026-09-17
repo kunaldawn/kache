@@ -298,6 +298,57 @@ But on **this** host huge pages are not available to the store's
 regardless - which is its own small bug, listed below.  The table sizes
 what a differently configured host would gain; it is not a kache result.
 
+The containers, measured the same way
+-------------------------------------
+
+Added later than the profile above, on the same machine, so the numbers
+share its caveats.  Engine tier, one thread, 64 byte values, 100k items:
+
+| scenario | ns/op | note |
+| --- | --- | --- |
+| `micro_get_hit` | 260 | a plain key, for scale |
+| `micro_kkv_get` | 237 | a field of a map |
+| `micro_kkv_set` | 255 | a field of a map |
+| `micro_kkv_scan` | 26 | per field, enumerating a map of 32 |
+| `micro_q_cycle` | 88 | per push or pop |
+| `micro_q_drain` | 14 | per message, 64 to a request |
+
+A field lookup is two hashes and two probes and still lands level with a
+plain `GET`.  The reason is the working set: 100k loose keys index into
+a table far larger than L2, while the same items as 3,125 maps of 32
+fields put the map, its 64 slot table and the fields it points at within
+a few cache lines of each other.  The second hash is free next to the
+miss it avoids.
+
+The queue numbers are the segment layout paying off.  A push is a bounds
+check and a `memcpy` into a segment that is already there; it reaches
+the allocator once per segment, not once per message, and never touches
+the index at all.  That is why it costs a third of a `db_set` of the
+same bytes.
+
+Over HTTP, 8 threads at depth 16, one run so the rows are comparable:
+
+| endpoint | ops/s |
+| --- | --- |
+| `GET /kv/<key>` | 2,797,764 |
+| `GET /kkv/<key>?f=<field>` | 2,475,361 |
+| `PUT /kv/<key>` | 2,477,630 |
+| `PUT /kkv/<key>?f=<field>` | 1,483,778 |
+| `POST /q` + `POST /qpop` | 2,407,455 |
+
+The field write is the one gap, and the engine tier says it is not the
+store - `micro_kkv_set` and `micro_set_over` are within four percent.  It
+is the request: a longer path, a percent decoded field to lift out of
+the query, and two expiries to look for instead of one, which is five
+scans of the query string where a plain `PUT` does three.
+
+A warning about this machine, learned by being caught by it: it is a
+laptop and it throttles.  The first measurement after an idle period is
+reliably 30-40% faster than the same measurement five minutes into a
+benchmark run, whatever is being measured.  A comparison against a
+baseline recorded in a different session is therefore worthless.  Run
+the two builds alternately, in the same session, and read the pairs.
+
 What is still on the table
 --------------------------
 
@@ -336,6 +387,12 @@ change set.
   value in the arena, rebuilt on write, and patch the 29 date bytes in
   place on the way out.  The front end is roughly two thirds of
   per-request CPU at P=16.
+- **One pass over the query string.**  A container write reads `f`,
+  `ttl`, `ttlms`, `kttl`, `kttlms` and `flags`, which is six scans of a
+  string that is usually under twenty bytes.  One pass filling a small
+  struct would fold them into one, and would help `/kv/` too.  Sized at
+  the gap in the table above, so tens of nanoseconds a request, not
+  hundreds.
 - **A co-located client** that maps the store read-only and does lookups
   in its own address space: no socket, no syscall, no copy.  Needs the
   seqlock first.

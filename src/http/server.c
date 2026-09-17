@@ -222,6 +222,13 @@ worker_main(void *arg)
 		}
 		if (now - last_reap >= 1000) {
 			reap_idle(w, now);
+			/* Give back what deleting a container left behind.
+			 * Requests do this too, on their way in, but only
+			 * to the shard they were going to touch anyway - a
+			 * store nobody is asking about would otherwise
+			 * hold the memory until something needed it. */
+			db_reclaim(w->ctx.db, (u32)w->id, nworkers,
+			           CFG_RECLAIM_BUDGET);
 			last_reap = now;
 		}
 		/* One worker carries the periodic flush for all of them.
