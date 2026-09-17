@@ -285,6 +285,7 @@ etag_value(Str s, u64 *out)
 	X(200, "OK")                                                   \
 	X(201, "Created")                                              \
 	X(204, "No Content")                                           \
+	X(307, "Temporary Redirect")                                   \
 	X(400, "Bad Request")                                          \
 	X(403, "Forbidden")                                            \
 	X(404, "Not Found")                                            \

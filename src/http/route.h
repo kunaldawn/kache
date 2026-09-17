@@ -2,7 +2,9 @@
 #ifndef KACHE_ROUTE_H
 #define KACHE_ROUTE_H
 
+#include "cluster/cluster.h"
 #include "http/buf.h"
+#include "http/hot.h"
 #include "http/http.h"
 #include "http/stats.h"
 #include "store/db.h"
@@ -10,6 +12,8 @@
 typedef struct Ctx {
 	Db    *db;
 	Stats *st;
+	Hot   *hot;           /* this worker's hot set, NULL when disabled */
+	Cluster *cl;          /* NULL when this node stands alone */
 	i64    default_ttl;   /* ms, DB_FOREVER when items never expire */
 	size_t max_req;       /* largest request we will buffer */
 	u64    started;       /* ms since the epoch */

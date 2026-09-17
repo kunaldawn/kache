@@ -34,7 +34,9 @@ typedef struct Stats {
 	Counter kkv_dels;
 	Counter q_pushes;
 	Counter q_pops;
-	u8      pad[192 - 19 * 8];
+	Counter hot_hits;      /* answered from the worker's hot set */
+	Counter hot_fills;     /* responses admitted into it */
+	u8      pad[192 - 21 * 8];
 } Stats;
 
 _Static_assert(sizeof(Stats) == 192, "stats must stay three cache lines");
@@ -73,6 +75,6 @@ Stats *stats_of(unsigned i);
 /* sum every worker's counters into a plain snapshot */
 void   stats_sum(u64 *out, unsigned n);
 
-#define STATS_FIELDS 19
+#define STATS_FIELDS 21
 
 #endif /* KACHE_STATS_H */

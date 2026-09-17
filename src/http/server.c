@@ -301,7 +301,13 @@ server_run(Db *db, const ServerCfg *cfg)
 		w->ctx.started = began;
 		w->ctx.allow_flush = cfg->allow_flush;
 		w->ctx.minimal = cfg->minimal;
+		w->ctx.cl = cfg->cl;
 		w->ctx.max_req = (size_t)db->map.maxval + CFG_REQ_SLACK;
+		/* Per worker and never shared, which is the whole point of
+		 * it; allocated here so the memory is faulted in by the
+		 * thread that will own it once affinity has placed it. */
+		if (cfg->hot_ms)
+			w->ctx.hot = hot_new(began, cfg->hot_ms);
 
 		if ((w->lfd = listen_on(cfg)) < 0)
 			goto fail;
@@ -350,6 +356,8 @@ out:
 
 		if (w->pool.slots)
 			pool_fini(&w->pool);
+		if (w->ctx.hot)
+			hot_free(w->ctx.hot);
 		if (w->wfd >= 0)
 			close(w->wfd);
 		if (w->epfd >= 0)

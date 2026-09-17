@@ -1,0 +1,110 @@
+# kache - a three node cluster behind nginx, for trying the thing out.
+#
+#     docker compose up --build -d
+#     sh deploy/smoke.sh
+#
+# Works with podman compose too; the Containerfile is what both build.
+#
+# Ports, and which one you want:
+#
+#   7080  nginx, round robin over all three  <- a client that knows
+#                                               nothing about the cluster
+#   7071  kache0, nothing in the way  \
+#   7072  kache1, nothing in the way   }     <- benchmarks go here
+#   7073  kache2, nothing in the way  /
+#
+# Benchmark against 7071-7073, never 7080.  nginx does not pipeline to an
+# upstream, so a pipelined client gets no pipelining at all through it:
+# measured on this rig, `kache-bench -P 16` reported 517,900 ops/s against
+# a node directly and 1,984 through nginx, which is 261x and is a
+# measurement of nginx's request loop rather than of kache.  The balancer
+# is here to show that a client needs no knowledge of the cluster, not to
+# be quick.
+#
+# -U is what makes a redirect followable from outside.  The nodes reach
+# each other as kache0:7070 and so on, which is a name that means nothing
+# on the host, so each node is told the address a client should use
+# instead and puts that in the Location.  It defaults to 127.0.0.1; set
+# ADVERTISE_HOST to reach the cluster from another machine.
+#
+# Any of the ports can be moved if something already holds one:
+#
+#     PORT_LB=9200 docker compose up -d
+#     ADVERTISE_HOST=192.168.1.10 docker compose up -d
+#
+# Every node is given the same -C list in the same order, which is
+# required: ownership is computed from it, and so is the hash seed.  The
+# stores are tmpfs and every node starts with -n, so a restart is a clean
+# cluster - this file is a test rig, not a deployment.
+
+x-kache: &kache
+  build:
+    context: .
+    dockerfile: Containerfile
+  restart: unless-stopped
+  # The store is a file, and here it is a file in RAM: this rig is for
+  # trying things, and a tmpfs keeps the disk out of the measurement the
+  # way doc/PERF.md's own runs did.  The mode is not decoration - a tmpfs
+  # mounts root owned and hides the ownership the image gave /data, and
+  # the image runs as an unprivileged user, so without it every node dies
+  # on "Permission denied" before it opens its store.
+  tmpfs:
+    - /data:mode=1777
+  healthcheck:
+    test: ["CMD", "wget", "-qO-", "http://127.0.0.1:7070/health"]
+    interval: 2s
+    timeout: 2s
+    retries: 15
+    start_period: 2s
+
+# -C must be byte for byte identical on every node.  Splitting it across
+# services by hand is how a cluster ends up with two hash seeds and a
+# quietly divided keyspace, so it is written once here.
+x-cluster: &cluster "kache0:7070,kache1:7070,kache2:7070"
+
+services:
+  kache0:
+    <<: *kache
+    container_name: kache0
+    # Published with no proxy in the path, because this is where a
+    # benchmark belongs and where a followed redirect has to land.
+    ports: ["${PORT_N0:-7071}:7070"]
+    command: ["-f", "/data/kache.db", "-s", "512M", "-p", "7070",
+              "-l", "0.0.0.0", "-n", "-C", *cluster, "-N", "0",
+              "-U", "${ADVERTISE_HOST:-127.0.0.1}:${PORT_N0:-7071},${ADVERTISE_HOST:-127.0.0.1}:${PORT_N1:-7072},${ADVERTISE_HOST:-127.0.0.1}:${PORT_N2:-7073}",
+              "-Y", "50", "-X", "50"]
+
+  kache1:
+    <<: *kache
+    container_name: kache1
+    ports: ["${PORT_N1:-7072}:7070"]
+    command: ["-f", "/data/kache.db", "-s", "512M", "-p", "7070",
+              "-l", "0.0.0.0", "-n", "-C", *cluster, "-N", "1",
+              "-U", "${ADVERTISE_HOST:-127.0.0.1}:${PORT_N0:-7071},${ADVERTISE_HOST:-127.0.0.1}:${PORT_N1:-7072},${ADVERTISE_HOST:-127.0.0.1}:${PORT_N2:-7073}",
+              "-Y", "50", "-X", "50"]
+
+  kache2:
+    <<: *kache
+    container_name: kache2
+    ports: ["${PORT_N2:-7073}:7070"]
+    command: ["-f", "/data/kache.db", "-s", "512M", "-p", "7070",
+              "-l", "0.0.0.0", "-n", "-C", *cluster, "-N", "2",
+              "-U", "${ADVERTISE_HOST:-127.0.0.1}:${PORT_N0:-7071},${ADVERTISE_HOST:-127.0.0.1}:${PORT_N1:-7072},${ADVERTISE_HOST:-127.0.0.1}:${PORT_N2:-7073}",
+              "-Y", "50", "-X", "50"]
+
+  lb:
+    image: docker.io/library/nginx:1.27-alpine
+    container_name: kache-lb
+    restart: unless-stopped
+    # nginx always listens on 8080 inside the network, so only the host
+    # side of this moves.
+    ports: ["${PORT_LB:-7080}:8080"]
+    # Nothing to substitute: the nodes advertise their own client facing
+    # addresses through -U, so nginx has no redirects to rewrite and is
+    # only a round robin balancer.
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/kache.conf:ro
+    depends_on:
+      kache0: { condition: service_healthy }
+      kache1: { condition: service_healthy }
+      kache2: { condition: service_healthy }

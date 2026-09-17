@@ -448,6 +448,45 @@ value and wants the bytes, and does not suit one that reads a key to
 learn its `ETag` or its remaining TTL - though such a client can use
 `HEAD`, which keeps them.
 
+Clusters
+--------
+
+A node started with `-C` keeps a full copy of every key, so **reads are
+answered by whichever node they reach** and need no routing: point a
+client at any node, or at all of them behind round robin DNS.
+
+**Writes have one owner per key.**  Every node computes the owner from
+the key's hash, so they always agree, and a write arriving at a node
+that does not own the key is answered `307 Temporary Redirect` with the
+owner's URL in `Location`.  Behind NAT or inside containers the address
+the nodes use for each other is not one a client can resolve, so `-U`
+gives the client facing address of each node and redirects name that
+instead.  `307` preserves the method and the body, so any client that
+follows redirects works unchanged - `curl -L`, for instance.  A client
+that would rather not pay the extra round trip can remember which node
+answered and go straight there next time; ownership only moves when the
+member list does.
+
+    $ curl -sSL -X PUT -d hello http://any-node:7070/kv/greeting
+    $ curl http://some-other-node:7070/kv/greeting
+    hello
+
+A write is visible on the owner at once and on the other nodes after one
+`-Y` interval, which defaults to 50ms.  Responses carry no staleness
+marker, so a caller that needs the authoritative value must read from
+the owner - the node that answers a write without redirecting.
+
+`/stats` reports `cluster_nodes`, `cluster_self`, `repl_sent_total`,
+`repl_received_total` and `repl_failures_total`.  The gap between
+`repl_sent_total` and `sets_total` is the fanout coalescing: writes to
+one key inside an interval are shipped once, carrying the last value.
+
+Only plain keys replicate.  Maps and queues stay on the node they were
+written to, and `/mset` and `/mdel` are applied locally without being
+routed to owners, so in a cluster they should be sent to the owner of
+the keys they carry or avoided.
+
+
 Status codes
 ------------
 
@@ -456,6 +495,7 @@ Status codes
 | `200` | value or document returned |
 | `201` | key created |
 | `204` | done, nothing to return |
+| `307` | this node is in a cluster and does not own the key; `Location` names the node that does |
 | `400` | malformed request, key or parameter |
 | `403` | `/flush` without `-F` |
 | `404` | no such key or endpoint |

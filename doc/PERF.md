@@ -267,6 +267,98 @@ Every new knob defaults to today's behaviour: `CFG_MINIMAL 0`,
 `CFG_AFFINITY 0`, `CFG_THREADS_SMT 1`.  `CFG_ATIME_SLACK 0` and
 `CFG_TOUCH_MS 0` each restore the unconditional path.
 
+The hot key
+-----------
+
+Everything above measures a spread keyspace.  A key that carries a
+disproportionate share of the load behaves nothing like it, and the two
+tiers disagree about how - which is the whole reason this section
+exists.
+
+Taken the same way, same machine, same session, interleaved.
+`kache-micro`, `micro_get_mt`, 64 byte values:
+
+| threads | spread, 100k keys | one key | |
+| --- | --- | --- | --- |
+| 1 | 3,400,526 | **15,397,472** | 4.53x *faster* |
+| 2 | 5,878,764 | 9,383,739 | 1.60x |
+| 4 | 9,281,950 | 5,528,189 | 0.60x |
+| 8 | 10,372,000 | 4,330,968 | 0.42x |
+
+Two things worth separating.  **One key on one thread is the fastest
+thing this engine does** - 4.5x a spread keyspace, because the record,
+its bucket and its lock word never leave L1, and the working set table
+above says a large store is about 60% memory stalls.  And then **adding
+cores destroys it**: eight threads is 3.6x slower than one, where the
+spread keyspace scales 3.05x over the same range.  That is a lock
+convoy, and no implementation of the lock fixes it, because what is
+contended is the sharing and not the lock.
+
+Over HTTP none of it is visible.  `kache-bench`, 8 client threads,
+store filled through `-W fill` so the reads are hits:
+
+| | spread | one key | |
+| --- | --- | --- | --- |
+| P=1 | 200,819 | 198,574 | 0.99x |
+| P=16 | 1,982,663 | 2,048,724 | 1.03x |
+
+Both inside the +-15% this rig resolves.  The front end costs enough
+that a store operation varying between 96ns and 231ns does not move the
+total, which is the same conclusion the CPU per request table reached
+from the other direction.
+
+**The per worker hot set (`-X ms`, `CFG_HOT_MS`).**  Each worker keeps a
+small direct mapped set of *finished responses* for keys that have
+proved hot, and answers from it with one `memcpy` and a patched Date -
+no lock, no shard, no line another core wants.  Admission is a
+doorkeeper: a byte per hash bucket, cleared once a second, and a key
+needs `CFG_HOT_ADMIT` sightings in one window before it is allowed in.
+Medians of paired runs, interleaved:
+
+| workload | off | on | | hot |
+| --- | --- | --- | --- | --- |
+| one key, P=16 | 2,055,197 | 2,207,241 | **+7.4%**, 5 of 5 pairs | 99.8% |
+| one key, P=1 | 196,777 | 217,501 | **+10.5%**, 3 of 3 pairs | 98% |
+| 100k spread | 1,791,678 | 1,795,517 | 0.999x | **0.0%** |
+
+The last row is the one to read twice.  Nothing is admitted from a
+uniform 100,000 key workload, which is the doorkeeper refusing to
+thrash, and the cost of asking is unmeasurable.  The feature is off by
+default.
+
+**The number that matters is not the 7%.**  With 99.8% of requests
+answered without touching the store at all, the whole store cost is
+gone from the path - and the total moves by seven percent.  So the front
+end is around 93% of what a request costs at P=16, the measurement is an
+upper bound on *every* remaining store side optimisation, and the
+seqlock idea listed below is now bounded at something under that.  It
+also says where throughput has to come from instead: more nodes.
+
+Replication, measured
+---------------------
+
+`-C` gives every node a full copy, so a read is answered locally by
+whichever node it reaches and reads scale with node count.  Writes have
+one owner per key, fixed by the hash, and fan out on a coalescing
+interval.  What that buys, three nodes on this one machine, writes
+driven at the owner by `kache-bench -W set -k 1 -P 16 -t 4` for 3
+seconds with `-Y 50`:
+
+| | |
+| --- | --- |
+| writes taken by the owner | 3,786,672 |
+| frames shipped to peers | **61** |
+| ratio | **62,076x** |
+
+61 frames is 3 seconds divided by the 50ms interval, which is the
+point: **peer traffic is set by the flush interval and the number of
+hot keys, and owes nothing at all to the write rate.**  A key written
+3.8 million times is shipped sixty times, carrying the value it ended
+up with each time.  All three nodes converged on the same value.
+
+That is what makes a write hot key replicable.  The cost is a staleness
+window of one interval, and `-Y` is the knob that prices it.
+
 What was tried and rejected
 ---------------------------
 

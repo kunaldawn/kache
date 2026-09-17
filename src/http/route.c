@@ -1,11 +1,13 @@
 /* kache - the mapping from request to store operation, and back to a
  * status code.  This is the only file that knows the HTTP contract. */
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "config.h"
 #include "http/route.h"
 #include "util/clk.h"
+#include "util/hash.h"
 
 #define KEYMAX CFG_MAX_KEY
 
@@ -202,6 +204,78 @@ meta_headers(Hdrs *h, const DbMeta *m)
 
 /* ---- handlers ------------------------------------------------------- */
 
+/* Whether this request's answer is one the hot set may keep and replay.
+ * A cached response is replayed byte for byte with only its Date
+ * refreshed, so anything that could vary it has to be excluded here
+ * rather than tested at replay time: a HEAD withholds the body, an
+ * HTTP/1.0 client needs the keep-alive echo that minimal mode drops, and
+ * a close response carries a Connection header the next client will not
+ * want.  A conditional request is excluded although reading does not act
+ * on If-Match or If-None-Match today - it is the one exclusion guarding
+ * something that does not exist yet, and it is here so that teaching the
+ * read path to answer 304 does not silently start replaying a 200. */
+static inline int
+hot_ok(const Ctx *c, const Req *r, int ka, const Key *k)
+{
+	return c->hot && r->meth == M_GET && ka && r->minor &&
+	       !r->ifmatch.n && !r->ifnone.n && k->n <= CFG_HOT_KEY;
+}
+
+
+/* ---- cluster routing -------------------------------------------------
+ *
+ * Reads are answered by whichever node they reach, out of that node's own
+ * copy, which is the whole point: a hot key is on every node and no read
+ * ever waits for a peer.  Writes are not.  A key's writes belong to one
+ * owner, fixed by the hash, so that replicas receive a single ordered
+ * stream and there is no conflict to resolve; a write that lands
+ * anywhere else is sent to the owner rather than applied here.
+ *
+ * It is a redirect and not a forward.  Forwarding would make this node
+ * hold a request open while it waits on another one, which is how a slow
+ * peer turns into this node's queue; a redirect hands the decision back
+ * to the client, which can also remember it and stop guessing wrong.
+ * 307 is the one that preserves the method and the body. */
+static int
+elsewhere(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
+{
+	char loc[512];
+	unsigned owner;
+	u64 h;
+	size_t n;
+	Hdrs hd;
+
+	if (!c->cl)
+		return 0;
+	h = hash_bytes(k->c, k->n, c->db->map.seed);
+	if (cl_is_mine(c->cl, h))
+		return 0;
+	owner = cl_owner(c->cl, h);
+	/* The path is echoed back exactly as it arrived, still percent
+	 * encoded, so a key that needed escaping stays escaped. */
+	n = (size_t)snprintf(loc, sizeof(loc), "http://%s%.*s%s%.*s",
+	    cl_client_addr(c->cl, owner), (int)r->path.n, r->path.p,
+	    r->query.n ? "?" : "", (int)r->query.n, r->query.p);
+	if (n >= sizeof(loc)) {
+		fail(c, out, 414, ka, "redirect target too long");
+		return 1;
+	}
+	hdrs_start(&hd, 307, clk_date(), c->minimal_req);
+	hdrs_add(&hd, "Location", loc, n);
+	hdrs_end(&hd, 0, ka);
+	buf_put(out, hd.b, hd.n);
+	return 1;
+}
+
+/* Tell the flusher this node changed a key.  Called after the write has
+ * landed, never on the path that applies one arriving from a peer. */
+static inline void
+replicate(Ctx *c, const Key *k)
+{
+	if (c->cl)
+		cl_dirty(c->cl, k->c, k->n);
+}
+
 static void
 do_get(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
 {
@@ -209,7 +283,28 @@ do_get(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
 	DbMeta m;
 	Hdrs h;
 	u8 nothing;
-	int rc, tries, head = (r->meth == M_HEAD);
+	u64 hash = 0, now = 0;
+	int rc, tries, cache = 0, head = (r->meth == M_HEAD);
+
+	if (hot_ok(c, r, ka, k)) {
+		const HotEnt *e;
+
+		now = now_ms();
+		hash = hash_bytes(k->c, k->n, c->db->map.seed);
+		if ((e = hot_get(c->hot, hash, k->c, k->n, now)) != NULL) {
+			/* The whole answer, headers and body, in one copy.
+			 * buf_put may reallocate, so the Date is patched
+			 * through the buffer after the copy rather than
+			 * through a pointer taken before it. */
+			buf_put(out, e->resp, e->rlen);
+			memcpy(out->p + mark + e->doff, clk_date(),
+			       CLK_DATE_LEN);
+			st_inc(&c->st->hits);
+			st_inc(&c->st->hot_hits);
+			return;
+		}
+		cache = 1;
+	}
 
 	if (head) {
 		rc = db_get(c->db, k->c, k->n, &nothing, 0, &m);
@@ -252,6 +347,23 @@ do_get(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
 	}
 	hdrs_end(&h, m.vlen, ka);
 	http_wrap(out, mark, &h);
+
+	/* The response is finished and contiguous from mark, which is the
+	 * one moment it can be kept whole.  Admission is asked only here,
+	 * on a path that has already missed, so a key that is in the set
+	 * never touches the doorkeeper at all. */
+	if (cache) {
+		u32 rlen = (u32)(out->len - mark);
+		int doff;
+
+		if (rlen <= CFG_HOT_RESP &&
+		    (doff = hot_date_off(out->p + mark, rlen)) >= 0 &&
+		    hot_admit(c->hot, hash, now)) {
+			hot_fill(c->hot, hash, k->c, k->n, out->p + mark,
+			         rlen, (u32)doff, now);
+			st_inc(&c->st->hot_fills);
+		}
+	}
 }
 
 static void
@@ -263,6 +375,15 @@ do_put(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
 	u64 cas = 0;
 	u32 flags;
 	int mode = SET_ANY, rc;
+
+	if (elsewhere(c, r, out, ka, k))
+		return;
+	/* This worker just changed a value, so its own cached answers
+	 * are suspect.  Retiring the whole set is one store; finding
+	 * the one entry would cost a hash of the written key on every
+	 * write, to retire at most one. */
+	if (c->hot)
+		hot_dirty(c->hot);
 
 	if (r->ifnone.n) {
 		if (r->ifnone.n != 1 || r->ifnone.p[0] != '*') {
@@ -301,6 +422,7 @@ do_put(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
 		return;
 	}
 	st_inc(&c->st->sets);
+	replicate(c, k);
 	hdrs_start(&h, m.created ? 201 : 204, clk_date(), c->minimal_req);
 	meta_headers(&h, &m);
 	hdrs_end(&h, 0, ka);
@@ -312,6 +434,15 @@ do_del(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
 {
 	u64 cas = 0;
 	int use_cas = 0, rc;
+
+	if (elsewhere(c, r, out, ka, k))
+		return;
+	/* This worker just changed a value, so its own cached answers
+	 * are suspect.  Retiring the whole set is one store; finding
+	 * the one entry would cost a hash of the written key on every
+	 * write, to retire at most one. */
+	if (c->hot)
+		hot_dirty(c->hot);
 
 	if (r->ifmatch.n && !(r->ifmatch.n == 1 && r->ifmatch.p[0] == '*')) {
 		if (etag_value(r->ifmatch, &cas) < 0) {
@@ -326,6 +457,7 @@ do_del(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
 		return;
 	}
 	st_inc(&c->st->dels);
+	replicate(c, k);
 	http_simple(out, 204, clk_date(), ka, c->minimal_req);
 }
 
@@ -337,6 +469,15 @@ do_incr(Ctx *c, const Req *r, Buf *out, int ka, const Key *k, int sign)
 	Hdrs h;
 	i64 delta = 1, init = 0, ttl, result;
 	int set_ttl, rc;
+
+	if (elsewhere(c, r, out, ka, k))
+		return;
+	/* This worker just changed a value, so its own cached answers
+	 * are suspect.  Retiring the whole set is one store; finding
+	 * the one entry would cost a hash of the written key on every
+	 * write, to retire at most one. */
+	if (c->hot)
+		hot_dirty(c->hot);
 
 	if (query_i64(r->query, "by", &delta) == -2) {
 		fail(c, out, 400, ka, "bad by");
@@ -364,6 +505,7 @@ do_incr(Ctx *c, const Req *r, Buf *out, int ka, const Key *k, int sign)
 		return;
 	}
 	st_inc(&c->st->incrs);
+	replicate(c, k);
 	buf_puti(out, result);
 	hdrs_start(&h, 200, clk_date(), c->minimal_req);
 	hdrs_lit(&h, "Content-Type", CT_TXT);
@@ -377,14 +519,24 @@ do_cat(Ctx *c, const Req *r, Buf *out, int ka, const Key *k, int prepend)
 {
 	DbMeta m;
 	Hdrs h;
-	int rc = db_cat(c->db, k->c, k->n, r->body.p, (u32)r->body.n,
-	                prepend, &m);
+	int rc;
 
+	if (elsewhere(c, r, out, ka, k))
+		return;
+	/* This worker just changed a value, so its own cached answers
+	 * are suspect.  Retiring the whole set is one store; finding
+	 * the one entry would cost a hash of the written key on every
+	 * write, to retire at most one. */
+	if (c->hot)
+		hot_dirty(c->hot);
+
+	rc = db_cat(c->db, k->c, k->n, r->body.p, (u32)r->body.n, prepend, &m);
 	if (rc != DB_OK) {
 		fail_db(c, out, rc, ka);
 		return;
 	}
 	st_inc(&c->st->cats);
+	replicate(c, k);
 	hdrs_start(&h, 204, clk_date(), c->minimal_req);
 	meta_headers(&h, &m);
 	hdrs_num(&h, "X-Kache-Length", (i64)m.vlen);
@@ -400,6 +552,15 @@ do_touch(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
 	i64 ttl;
 	int rc;
 
+	if (elsewhere(c, r, out, ka, k))
+		return;
+	/* This worker just changed a value, so its own cached answers
+	 * are suspect.  Retiring the whole set is one store; finding
+	 * the one entry would cost a hash of the written key on every
+	 * write, to retire at most one. */
+	if (c->hot)
+		hot_dirty(c->hot);
+
 	if (take_ttl(r, c->default_ttl, &ttl) < 0) {
 		fail(c, out, 400, ka, "bad ttl");
 		return;
@@ -409,6 +570,7 @@ do_touch(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
 		return;
 	}
 	st_inc(&c->st->touches);
+	replicate(c, k);
 	hdrs_start(&h, 204, clk_date(), c->minimal_req);
 	meta_headers(&h, &m);
 	hdrs_end(&h, 0, ka);
@@ -428,7 +590,7 @@ collect(Ctx *c, Metric *mt, size_t cap)
 {
 	enum { REQ, HIT, MISS, SET, DEL, INCR, CAT, TOUCH, ERR,
 	       ACCEPT, CLOSE, CUR, BIN, BOUT,
-	       KKVR, KKVW, KKVD, QPUSH, QPOP };
+	       KKVR, KKVW, KKVD, QPUSH, QPOP, HOTH, HOTF };
 	u64 s[STATS_FIELDS];
 	DbStats d;
 	size_t n = 0;
@@ -467,6 +629,21 @@ collect(Ctx *c, Metric *mt, size_t cap)
 	M("map_deletes_total", "counter", s[KKVD]);
 	M("queue_pushes_total", "counter", s[QPUSH]);
 	M("queue_pops_total", "counter", s[QPOP]);
+	if (c->cl) {
+		u64 sent, recvd, failed;
+
+		cl_stats(c->cl, &sent, &recvd, &failed);
+		M("cluster_nodes", "gauge", cl_nodes(c->cl));
+		M("cluster_self", "gauge", cl_self(c->cl));
+		/* Frames shipped, not writes taken.  The gap between this
+		 * and sets_total is the coalescing doing its job, and it is
+		 * the number to look at when peer traffic is a worry. */
+		M("repl_sent_total", "counter", sent);
+		M("repl_received_total", "counter", recvd);
+		M("repl_failures_total", "counter", failed);
+	}
+	M("hot_hits_total", "counter", s[HOTH]);
+	M("hot_fills_total", "counter", s[HOTF]);
 	M("reclaim_pending", "gauge", d.dead);
 #undef M
 	return n;
@@ -695,6 +872,30 @@ route(Ctx *c, const Req *r, Buf *out, int *keepalive)
 			do_touch(c, r, out, ka, &k);
 			return;
 		}
+		/* The peer facing endpoint.  It is not part of the client
+		 * API and is deliberately not in doc/API.md: it exists for
+		 * the flusher on another node, and applying a batch here
+		 * never marks anything dirty, which is what stops a write
+		 * circulating for ever. */
+		if (r->path.n == 7 && !memcmp(r->path.p, "/x/repl", 7)) {
+			u32 applied = 0;
+
+			if (!c->cl) {
+				fail(c, out, 404, ka, "not in a cluster");
+				return;
+			}
+			if (cl_apply(c->cl, r->body.p, r->body.n,
+			             &applied) < 0) {
+				fail(c, out, 400, ka, "bad replication batch");
+				return;
+			}
+			/* A replicated write lands underneath this worker's
+			 * cached answers just as a local one does. */
+			if (applied && c->hot)
+				hot_dirty(c->hot);
+			http_simple(out, 204, clk_date(), ka, c->minimal_req);
+			return;
+		}
 		if (r->path.n == 5 && !memcmp(r->path.p, "/mget", 5)) {
 			do_mget(c, r, out, ka, 0);
 			return;
@@ -718,6 +919,8 @@ route(Ctx *c, const Req *r, Buf *out, int *keepalive)
 			return;
 		}
 		db_flush(c->db);
+		if (c->hot)
+			hot_dirty(c->hot);
 		http_simple(out, 204, clk_date(), ka, c->minimal_req);
 		return;
 	}
@@ -800,6 +1003,9 @@ batch_field(Str *rest, Str *field)
 static void
 do_mget(Ctx *c, const Req *r, Buf *out, int ka, int del)
 {
+	/* /mdel comes through here too, and that one writes. */
+	if (del && c->hot)
+		hot_dirty(c->hot);
 	size_t mark = out->len;
 	const char *p = r->body.p, *end = r->body.p + r->body.n;
 	Hdrs h;
@@ -953,6 +1159,13 @@ do_mset(Ctx *c, const Req *r, Buf *out, int ka)
 	i64 ttl;
 	u32 flags, n = 0, stored = 0;
 	int rc, toomany = 0;
+
+	/* This worker just changed a value, so its own cached answers
+	 * are suspect.  Retiring the whole set is one store; finding
+	 * the one entry would cost a hash of the written key on every
+	 * write, to retire at most one. */
+	if (c->hot)
+		hot_dirty(c->hot);
 
 	if (take_ttl(r, c->default_ttl, &ttl) < 0) {
 		fail(c, out, 400, ka, "bad ttl");

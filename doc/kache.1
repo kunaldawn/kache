@@ -21,6 +21,11 @@
 .Op Fl B Ar bytes
 .Op Fl K Ar bytes
 .Op Fl V Ar bytes
+.Op Fl X Ar ms
+.Op Fl C Ar nodes
+.Op Fl N Ar index
+.Op Fl Y Ar ms
+.Op Fl U Ar addrs
 .Sh DESCRIPTION
 .Nm
 keeps a cache in a file mapped
@@ -136,6 +141,49 @@ is still always sent.  Responses to writes keep every header they
 otherwise would, so compare and swap and conditional requests still
 work; an HTTP/1.0 client, which needs the keep alive echo, is never
 answered minimally either.
+.It Fl X Ar ms
+Answer hot keys from a per worker set of finished responses, bypassing
+the store entirely.  A key is admitted only after it has been asked for
+often enough inside one decay window, so a keyspace with no hot key in
+it admits nothing.
+.Ar ms
+is how long an entry stands, and therefore how stale a read may be; a
+write retires the set of the worker that took it, so a client still
+reads its own writes.
+.Ql 0
+disables it, which is the default.
+.It Fl C Ar nodes
+Run as one node of a cluster, given every member as
+.Ql host:port
+separated by commas, in the same order on every node.  Each node keeps a
+full copy, so a read is answered locally by whichever node it reaches.
+A key's writes belong to one owner, computed from the hash, and a write
+arriving at any other node is answered
+.Ql 307
+with the owner in
+.Ql Location .
+The hash seed is derived from this list, so a store created under a
+different one is refused rather than serving a keyspace its peers
+disagree about.  Maps and queues are not replicated.
+.It Fl N Ar index
+This node's position in the
+.Fl C
+list, counting from zero.  The default is 0.
+.It Fl Y Ar ms
+How often a node ships what it has written to its peers, default 50.
+Writes to one key inside an interval are coalesced into a single frame
+carrying the last value, so peer traffic follows this interval and not
+the write rate.  It is also the staleness bound.
+.It Fl U Ar addrs
+The address of each
+.Fl C
+node as a client should reach it, in the same order, when that differs
+from the address the nodes use between themselves - behind NAT, inside
+containers, or under a proxy.  Only redirects are affected: replication
+keeps using the
+.Fl C
+addresses.  Without it a redirect names the peer address, which a client
+on the other side of the boundary cannot resolve.
 .It Fl A
 Pin each worker to one cpu,
 .Li i % ncpu ,

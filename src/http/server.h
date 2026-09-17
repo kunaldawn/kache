@@ -7,6 +7,8 @@
 #define KACHE_SERVER_H
 
 #include "store/db.h"
+
+struct Cluster;
 #include "util/util.h"
 
 typedef struct ServerCfg {
@@ -21,6 +23,8 @@ typedef struct ServerCfg {
 	int         allow_flush;
 	int         minimal;    /* drop the read side metadata headers */
 	int         affinity;   /* pin worker i to cpu i % ncpu() */
+	u64         hot_ms;     /* hot set freshness window, 0 = off */
+	struct Cluster *cl;     /* NULL when this node stands alone */
 } ServerCfg;
 
 int server_run(Db *db, const ServerCfg *cfg);

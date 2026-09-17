@@ -19,6 +19,14 @@ typedef struct MapCfg {
 	u32  maxkey;
 	u32  maxval;
 	u32  avg_item;        /* steers the index/arena split */
+	/* The hash seed, when the caller needs a particular one.  A store
+	 * on its own is happiest with a random seed, but the nodes of a
+	 * cluster have to agree about which node owns a key, and they work
+	 * that out from the hash alone - so they must hash alike.  0 keeps
+	 * the random seed; anything else is required to match a store that
+	 * already exists, and map_open refuses rather than quietly serving
+	 * a keyspace its peers disagree with. */
+	u64  seed;
 	int  flags;
 } MapCfg;
 

@@ -10,22 +10,28 @@ include config.mk
 UTIL = src/util/util.c src/util/clk.c src/util/lock.c
 STORE = src/store/map.c src/store/alloc.c src/store/shard.c \
         src/store/kkv.c src/store/queue.c src/store/db.c
-HTTP = src/http/buf.c src/http/stats.c src/http/http.c src/http/route.c \
-       src/http/conn.c src/http/server.c
+
+# cluster/ replication between nodes; the store and the front end
+# both stay unaware of it beyond one handle on the context
+CLUSTER = src/cluster/cluster.c
+HTTP = src/http/buf.c src/http/stats.c src/http/http.c src/http/hot.c \
+       src/http/route.c src/http/conn.c src/http/server.c
 
 # the engine without the front end, so the microbenchmark can link it
 CORE = $(UTIL) $(STORE)
 COREOBJ = $(CORE:.c=.o)
 
-SRC = $(UTIL) $(STORE) $(HTTP) src/main.c
+SRC = $(UTIL) $(STORE) $(CLUSTER) $(HTTP) src/main.c
 OBJ = $(SRC:.c=.o)
 
 TOOLS = kache-bench kache-micro kache-cmp
 
 HDR = src/util/util.h src/util/hash.h src/util/clk.h src/util/lock.h \
       src/store/store.h src/store/map.h src/store/alloc.h src/store/shard.h \
-      src/store/kkv.h src/store/queue.h src/store/db.h src/http/buf.h src/http/stats.h src/http/http.h \
-      src/http/route.h src/http/conn.h src/http/server.h config.h
+      src/store/kkv.h src/store/queue.h src/store/db.h src/http/buf.h \
+      src/http/stats.h src/http/http.h src/http/hot.h \
+      src/http/route.h src/http/conn.h src/http/server.h \
+      src/cluster/cluster.h config.h
 
 all: kache
 

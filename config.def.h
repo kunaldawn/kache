@@ -80,6 +80,56 @@
 #define CFG_CONT_BATCH_MAX   4096u
 #define CFG_CONT_DUMP_MAX    (8u << 20)
 
+/* ---- hot keys -------------------------------------------------------- */
+
+/* One key can carry a disproportionate share of the load, and when it
+ * does it behaves unlike every other key in the store.  Measured on the
+ * engine tier, a single key answers 4.5x faster than a spread keyspace
+ * on one thread - the record, its bucket and its lock word never leave
+ * L1 - and then collapses to a quarter of that on eight, because one
+ * exclusive lock and one cache line are all there is to share.  The
+ * answer is not a cleverer lock.  It is to stop reaching the shard at
+ * all: each worker keeps its own small set of finished responses for
+ * the keys that have proved hot, and answers them with a memcpy and a
+ * patched Date, touching nothing another core can see.
+ *
+ * The price is staleness bounded by CFG_HOT_MS: a write is invisible to
+ * the other workers for that long.  The worker that takes the write
+ * drops its own set at once, so a client on one connection still reads
+ * its own writes.  0 disables all of it. */
+#define CFG_HOT_MS           0u
+/* responses kept per worker, a power of two; direct mapped by hash */
+#define CFG_HOT_SLOTS        16u
+/* longest key that may be cached.  A longer one is never hot enough to
+ * be worth the bytes, and the cap is what keeps an entry compact. */
+#define CFG_HOT_KEY          64u
+/* largest finished response that may be cached */
+#define CFG_HOT_RESP         1024u
+/* Admission.  Caching on first sight would thrash the set on any real
+ * keyspace and pay the copy for keys that are never asked for twice, so
+ * a key has to be seen CFG_HOT_ADMIT times within one decay window
+ * before it is allowed in.  The counters are one byte each, indexed by
+ * hash, and shared between keys that collide - a doorkeeper, not an
+ * accounting record.  Clearing the whole array once per window is the
+ * decay; it costs a memset of CFG_HOT_DOOR bytes a second. */
+#define CFG_HOT_DOOR         4096u
+#define CFG_HOT_ADMIT        32u
+#define CFG_HOT_DECAY_MS     1000u
+
+/* ---- cluster --------------------------------------------------------- */
+
+/* How often a node ships what it has written to its peers.  This is the
+ * coalescing window, and it is the only thing that sets peer traffic: a
+ * key written a million times inside one window is sent once, carrying
+ * the value it ended up with.  Lower is fresher and chattier; the number
+ * that matters is that peer traffic is O(hot keys / interval) and owes
+ * nothing to the write rate.
+ *
+ * It is also the staleness bound.  A write is visible on the node that
+ * took it at once and on the others after one window plus a round
+ * trip. */
+#define CFG_REPL_MS          50u
+
 /* ---- eviction ------------------------------------------------------- */
 
 /* candidates inspected per eviction; larger is a better LRU approximation */

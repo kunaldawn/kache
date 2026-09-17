@@ -170,7 +170,7 @@ create(Map *m, const MapCfg *c)
 	h->version = ST_VERSION;
 	h->hdrsz = ST_HDR_SZ;
 	h->filesz = c->size;
-	h->seed = entropy64();
+	h->seed = c->seed ? c->seed : entropy64();
 	h->nshards = (u32)n;
 	h->shard_shift = (u32)__builtin_ctzll(n);
 	h->shards_off = ST_HDR_SZ;
@@ -222,6 +222,18 @@ adopt(Map *m, const MapCfg *c, u64 fsize)
 	    probe.shard_shift == 0 || probe.csum != csum(&probe)) {
 		warn("%s: not a kache store, or written by another version; "
 		     "use -n to start over", c->path);
+		return -1;
+	}
+
+	/* A seed the caller insisted on has to be the seed this file was
+	 * created with.  Rehashing the store to adopt it is possible and is
+	 * not what anyone wants at startup; serving with the wrong one is
+	 * worse, because every node would agree the store is fine and
+	 * disagree about who owns what. */
+	if (c->seed && h->seed != c->seed) {
+		warn("%s: hash seed is %llu, not the %llu this cluster needs; "
+		     "recreate it with -n", c->path,
+		     (unsigned long long)h->seed, (unsigned long long)c->seed);
 		return -1;
 	}
 

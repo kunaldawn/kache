@@ -202,6 +202,98 @@ The store is a cache, so this is best effort by construction.  The
 guarantee is that an unclean restart cannot produce a store that lies:
 either a record is intact and indexed, or it is gone.
 
+Hot keys
+--------
+
+Sharding answers contention by spreading keys over more locks, which
+does nothing at all when the load is on one key: every request wants the
+same shard, the same lock and the same cache line.  Measured, that is
+not a small effect in either direction - one key on one thread is the
+fastest thing the engine does, 4.5x a spread keyspace because nothing
+ever leaves L1, and the same key on eight threads is 3.6x slower than on
+one.  `doc/PERF.md` has the table.
+
+So the hot path stops sharing instead of sharing better.  Each worker
+keeps a small set of *finished responses* - headers and body, exactly as
+they would go out - for the keys that have proved hot, in memory no
+other thread touches.  A hot GET copies one out and patches the 29 byte
+Date.  No lock is taken, no line is pulled away from another core, and
+the answer costs the same on eight workers as on one.
+
+Not every key may be kept, and not every response.  A key has to earn a
+slot: a doorkeeper of one byte per hash bucket, cleared once a second,
+admits a key only after `CFG_HOT_ADMIT` sightings inside one window.
+Without it a uniform keyspace would evict the set on every request and
+pay the copy for keys nobody asks for twice - measured, a 100,000 key
+workload admits nothing and costs nothing.  The response has to be one
+that can be replayed byte for byte, so a HEAD, a conditional request, an
+HTTP/1.0 client and a connection being closed all fall through to the
+ordinary path.
+
+The cost is staleness bounded by `CFG_HOT_MS`.  A write retires the
+whole set of the worker that took it - a generation counter, so it is
+one store rather than a hash of the written key - and a connection
+belongs to one worker for its whole life, so a client still reads its
+own writes.  What it cannot see immediately is somebody else's.
+
+Replication
+-----------
+
+The same measurement that justifies the hot set also bounds it: with
+99.8% of requests answered without reaching the store, throughput moves
+by seven percent.  The front end is the rest, so a node is worth roughly
+what it is worth, and more throughput means more nodes.
+
+With one hot key there is no placement problem, which is what makes this
+small.  Every node keeps a copy, every read is answered locally by
+whichever node it arrives at, and nothing is partitioned.  There is no
+slot map, no consistent hashing, no migration and no topology for a
+client to learn - a client load balances by any means it likes,
+including round robin DNS.
+
+Writes are the only thing the nodes have to agree about, and they agree
+by not sharing.  A key's writes belong to one owner, and the owner is
+the top bits of the key's hash over the node count - so every node
+computes the same answer from the key alone, with no lookup and nothing
+to keep in sync.  A write arriving anywhere else is answered with a 307
+naming the owner.  It is a redirect and not a forward on purpose:
+forwarding would have one node holding a request open while it waits on
+another, which is how a slow peer becomes this node's queue.
+
+Because the owner is the only writer, a replica receives one stream from
+one source over one connection, in order.  That is the whole conflict
+resolution story - there is no vector clock, no timestamp in the record
+and no merge rule, and `Rec` did not have to grow a field.  CAS is
+unaffected, because it still happens on one node.  The owner's version
+does travel on the wire, but only as something to look at in a tcpdump:
+a replica assigns versions from its own shard counter, so the two
+numbers are not comparable and the code says so where it ignores it.
+
+Fanout coalesces, and that is the property that makes a *write* hot key
+replicable rather than merely a read hot one.  A worker taking a write
+records the key; the flusher reads the value when it sends.  So a key
+written 3.8 million times inside three seconds is shipped sixty one
+times - once per `-Y` interval - each time carrying the value it ended
+up with.  Peer traffic is O(hot keys / interval) and owes nothing to the
+write rate.
+
+A deletion has to travel in its own right, as a tombstone, precisely
+because the value is read at send time: a key that was deleted is simply
+not there any more, and without a frame saying so the peers would keep
+serving the copy they already had.
+
+Two things every node must share.  The member list, in the same order,
+since ownership is computed from it; and the hash seed, since ownership
+is computed from the hash.  A store seeds itself at random, so `-C`
+derives the seed from the member list - the cluster agrees without
+anyone configuring it, and a store created under a different list is
+refused at startup instead of quietly serving a keyspace its peers
+disagree about.
+
+What this does not do yet is listed honestly in README.md: containers
+are not replicated, batch writes are not routed, and a node that is down
+is retried rather than failed over.
+
 The front end
 -------------
 

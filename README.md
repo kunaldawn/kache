@@ -44,6 +44,60 @@ layer, no abstraction that exists to be replaced later.  Tunables live in
 defined.  If a feature is not there, it is because a caller can build it
 out of what is.
 
+Hot keys, and more than one node
+--------------------------------
+
+One key under heavy load is the case sharding cannot help with: every
+request wants the same shard, the same lock and the same cache line.
+Measured on this engine, one key on one thread is the *fastest* thing it
+does - 4.5x a spread keyspace, because nothing leaves L1 - and the same
+key on eight threads is 3.6x slower than on one.  `doc/PERF.md` has the
+tables.
+
+Two things address it, and both are off by default.
+
+`-X ms` gives each worker its own small set of finished responses for
+keys that have proved hot, answered with a `memcpy` and a patched Date -
+no lock, no shard, nothing another core can see.  A key earns its slot
+through a doorkeeper, so a uniform keyspace admits nothing and pays
+nothing.  The window is how stale a read may be.
+
+    $ kache -X 50
+
+`-C` runs several nodes, each holding a full copy, so reads are answered
+locally by whichever node they reach and scale with node count:
+
+    $ kache -f n0.db -p 7070 -C 10.0.0.1:7070,10.0.0.2:7070 -N 0
+    $ kache -f n1.db -p 7070 -C 10.0.0.1:7070,10.0.0.2:7070 -N 1
+
+Reads go anywhere - round robin DNS is enough, there is no topology for
+a client to learn.  A key's writes belong to one owner, computed from
+the hash by every node without asking anyone, and a write that lands
+elsewhere gets a 307 naming the owner.  Fanout coalesces on `-Y`, so a
+key written 3.8 million times in three seconds was shipped sixty one
+times, carrying its latest value each time: **peer traffic follows the
+flush interval, not the write rate.**  The cost is that a write is
+visible on other nodes after one interval.
+
+If the address nodes use for each other is not the one clients can reach
+- containers, NAT, a proxy in front - `-U` gives the client facing
+address of each node in the same order, and redirects name that instead.
+`docker-compose.yml` is a worked example: three nodes and an nginx
+balancer, up with `docker compose up --build -d` and checked with
+`sh deploy/smoke.sh`.  Benchmark the node ports it publishes, never the
+balancer - nginx does not pipeline to an upstream and measured 261x
+slower on the same data.
+
+Every node needs the same `-C` list in the same order.  The hash seed is
+derived from that list, so the cluster agrees without configuration, and
+a store built under a different list is refused at startup rather than
+silently splitting the keyspace.
+
+What is not there yet: only plain keys replicate, so maps and queues
+stay node local; `/mset` and `/mdel` are not routed to owners; and a
+node that is down is retried on the next flush rather than failed over,
+so its keys keep their owner and the writes wait.
+
 Layout
 ------
 
@@ -52,6 +106,7 @@ Layout
     src/util/        primitives: types, clock, futex mutex, hash
     src/store/       the mapped file, allocator, index, operations
     src/http/        buffers, parser, router, connections, event loops
+    src/cluster/     replication between nodes
     src/main.c       argument handling and startup
     test/test.sh     end to end checks (make check)
     test/micro.c     engine benchmarks, linked against the store

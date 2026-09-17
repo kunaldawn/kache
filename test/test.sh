@@ -9,12 +9,21 @@ URL="http://127.0.0.1:$PORT"
 fails=0
 pid=
 pid2=
+pid3=
+pid4=
+pid5=
 
 cleanup() {
 	[ -n "$pid" ] && kill "$pid" 2>/dev/null
 	wait "$pid" 2>/dev/null
 	[ -n "$pid2" ] && kill "$pid2" 2>/dev/null
 	wait "$pid2" 2>/dev/null
+	[ -n "$pid3" ] && kill "$pid3" 2>/dev/null
+	wait "$pid3" 2>/dev/null
+	[ -n "$pid4" ] && kill "$pid4" 2>/dev/null
+	wait "$pid4" 2>/dev/null
+	[ -n "$pid5" ] && kill "$pid5" 2>/dev/null
+	wait "$pid5" 2>/dev/null
 	rm -rf "$DIR"
 }
 trap cleanup EXIT INT TERM
@@ -483,6 +492,176 @@ has   "default etag"       "$h" '^ETag: "'
 has   "default ttl"        "$h" '^X-Kache-TTL:'
 has   "default flags"      "$h" '^X-Kache-Flags:'
 has   "default keep-alive" "$h" '^Connection: keep-alive$'
+
+echo "hot set"
+# A third server with the per worker hot set on and one worker, so every
+# request lands on the same set and the admission threshold is reached.
+# One worker is what makes the invalidation assertions deterministic: a
+# write only retires the set of the worker that took it.
+PORT3=${PORT3:-$((PORT + 2))}
+URL3="http://127.0.0.1:$PORT3"
+"$BIN" -f "$DIR/hot.db" -s 64M -p "$PORT3" -F -q -t 1 -X 60000 >>"$DIR/log" 2>&1 &
+pid3=$!
+i=0
+while ! curl -sS -m 1 -o /dev/null "$URL3/health" 2>/dev/null; do
+	i=$((i + 1))
+	[ $i -gt 50 ] && { echo "hot server did not start"; cat "$DIR/log"; exit 1; }
+	sleep 0.1
+done
+
+# warm returns once the key has been asked for enough times to be
+# admitted; CFG_HOT_ADMIT is 32, so 40 is comfortably past it
+warm() {
+	i=0
+	while [ $i -lt 40 ]; do
+		curl -sS -m 10 -o /dev/null "$1" 2>/dev/null
+		i=$((i + 1))
+	done
+}
+
+curl -sS -m 10 -o /dev/null -X PUT -d hv1 "$URL3/kv/hk"
+warm "$URL3/kv/hk"
+body  "hot serves the value"   hv1 "$URL3/kv/hk"
+has   "hot set is being used"  "$(curl -sS "$URL3/stats")" '^hot_hits_total [1-9]'
+
+# a write on this worker must retire the set, or the old value lingers
+curl -sS -m 10 -o /dev/null -X PUT -d hv2 "$URL3/kv/hk"
+body  "write retires the set"  hv2 "$URL3/kv/hk"
+curl -sS -m 10 -o /dev/null -X POST -d x "$URL3/append/hk"
+body  "append retires it"      hv2x "$URL3/kv/hk"
+curl -sS -m 10 -o /dev/null -X DELETE "$URL3/kv/hk"
+check "delete retires it"      404 "$URL3/kv/hk"
+
+# two keys that are both hot must not be served each other's bytes
+curl -sS -m 10 -o /dev/null -X PUT -d aaa "$URL3/kv/ha"
+curl -sS -m 10 -o /dev/null -X PUT -d bbb "$URL3/kv/hb"
+warm "$URL3/kv/ha"
+warm "$URL3/kv/hb"
+body  "hot key a is itself"    aaa "$URL3/kv/ha"
+body  "hot key b is itself"    bbb "$URL3/kv/hb"
+
+# a replayed response carries a fresh Date, not the one it was built with
+curl -sS -m 10 -o /dev/null -X PUT -d dv "$URL3/kv/hd"
+warm "$URL3/kv/hd"
+d1=$(hdr "$URL3/kv/hd" | sed -n 's/^Date: //p')
+sleep 2
+d2=$(hdr "$URL3/kv/hd" | sed -n 's/^Date: //p')
+[ -n "$d1" ] && [ "$d1" != "$d2" ] && ok "replayed date is refreshed" \
+	|| bad "replayed date is refreshed" "date stuck at '$d1'"
+has   "replayed response intact" "$(hdr "$URL3/kv/hd")" '^Content-Length: 2$'
+
+# a body with a NUL must survive being replayed out of the set
+printf 'a\0b' > "$DIR/hbin"
+curl -sS -m 10 -o /dev/null -X PUT --data-binary "@$DIR/hbin" "$URL3/kv/hbin"
+warm "$URL3/kv/hbin"
+curl -sS -m 10 -o "$DIR/hgot" "$URL3/kv/hbin"
+cmp -s "$DIR/hbin" "$DIR/hgot" && ok "hot binary body intact" \
+	|| bad "hot binary body intact" "value came back changed"
+
+# A conditional GET is not answered from the set.  kache does not act on
+# If-None-Match when reading - a conditional GET is answered in full, the
+# same as any other - so what this pins is that the hot set does not
+# change that answer, and that the exclusion in hot_ok stays in place for
+# whenever reading does learn to answer 304.
+etag3=$(hdr "$URL3/kv/ha" | sed -n 's/^ETag: "\(.*\)"$/\1/p')
+[ -n "$etag3" ] && ok "hot response carries an etag" \
+	|| bad "hot response carries an etag" "no ETag on a replayed response"
+check "conditional get is not cached" 200 -H "If-None-Match: \"$etag3\"" "$URL3/kv/ha"
+body  "conditional get is correct"    aaa -H "If-None-Match: \"$etag3\"" "$URL3/kv/ha"
+
+kill "$pid3" 2>/dev/null; wait "$pid3" 2>/dev/null; pid3=
+
+
+echo "cluster"
+# Two nodes, each a full copy.  Ports are separate from the servers above
+# because those hold their own stores and this pair needs a shared hash
+# seed, which -C derives from the member list.
+PORT4=${PORT4:-$((PORT + 3))}
+PORT5=${PORT5:-$((PORT + 4))}
+CNODES="127.0.0.1:$PORT4,127.0.0.1:$PORT5"
+U4="http://127.0.0.1:$PORT4"
+U5="http://127.0.0.1:$PORT5"
+"$BIN" -f "$DIR/c0.db" -s 64M -p "$PORT4" -n -q -C "$CNODES" -N 0 -Y 20 >>"$DIR/log" 2>&1 &
+pid4=$!
+"$BIN" -f "$DIR/c1.db" -s 64M -p "$PORT5" -n -q -C "$CNODES" -N 1 -Y 20 >>"$DIR/log" 2>&1 &
+pid5=$!
+i=0
+while ! curl -sS -m 1 -o /dev/null "$U4/health" 2>/dev/null ||
+      ! curl -sS -m 1 -o /dev/null "$U5/health" 2>/dev/null; do
+	i=$((i + 1))
+	[ $i -gt 50 ] && { echo "cluster did not start"; cat "$DIR/log"; exit 1; }
+	sleep 0.1
+done
+
+has "cluster size is known" "$(curl -sS "$U4/stats")" '^cluster_nodes 2$'
+
+# Both nodes must name the same owner for a key.  One of them answers the
+# write itself and the other redirects to it; which is which depends on
+# the hash, so the test asserts they agree rather than naming a node.
+o4=$(curl -sS -o /dev/null -w '%{redirect_url}' -m 10 -X PUT -d x "$U4/kv/ck")
+o5=$(curl -sS -o /dev/null -w '%{redirect_url}' -m 10 -X PUT -d x "$U5/kv/ck")
+if [ -n "$o4" ] && [ -z "$o5" ]; then
+	ok "nodes agree on the owner"
+	owner=$U5
+elif [ -z "$o4" ] && [ -n "$o5" ]; then
+	ok "nodes agree on the owner"
+	owner=$U4
+else
+	bad "nodes agree on the owner" "both claimed or both redirected"
+	owner=$U4
+fi
+case "${o4}${o5}" in
+	*"/kv/ck"*) ok  "redirect keeps the path" ;;
+	*)          bad "redirect keeps the path" "got '${o4}${o5}'" ;;
+esac
+
+# A write to the owner reaches the other node within a flush interval.
+curl -sS -m 10 -o /dev/null -X PUT -d replicated "$owner/kv/ck"
+sleep 0.3
+body "replicated to node 0" replicated "$U4/kv/ck"
+body "replicated to node 1" replicated "$U5/kv/ck"
+
+# The last write wins everywhere, and coalescing means far fewer frames
+# than writes were shipped to get there.
+# The burst goes down one connection in a single curl, because that is the
+# condition coalescing exists for: writes arriving faster than the flush
+# interval.  One curl per write would spend longer starting the process
+# than the window lasts, and every write would get a window to itself -
+# which is correct behaviour and would tell us nothing.
+sent0=$(curl -sS "$owner/stats" | awk '/^repl_sent_total/{print $2}')
+set -- -o /dev/null -X PUT -d w0 "$owner/kv/ck"
+i=1
+while [ $i -lt 60 ]; do
+	set -- "$@" --next -o /dev/null -X PUT -d "w$i" "$owner/kv/ck"
+	i=$((i + 1))
+done
+curl -sS -m 30 "$@" >/dev/null 2>&1
+sleep 0.3
+body "converged on node 0" w59 "$U4/kv/ck"
+body "converged on node 1" w59 "$U5/kv/ck"
+sent1=$(curl -sS "$owner/stats" | awk '/^repl_sent_total/{print $2}')
+[ "$((sent1 - sent0))" -lt 60 ] && ok "writes were coalesced" \
+	|| bad "writes were coalesced" "60 writes shipped $((sent1 - sent0)) frames"
+
+# A delete has to travel as a tombstone; without one the peer would keep
+# serving the copy it already had.
+curl -sS -m 10 -o /dev/null -X DELETE "$owner/kv/ck"
+sleep 0.3
+check "delete reached node 0" 404 "$U4/kv/ck"
+check "delete reached node 1" 404 "$U5/kv/ck"
+
+# A store created under a different member list hashes differently, so
+# joining with it would split the keyspace silently.  It must not start.
+if "$BIN" -f "$DIR/c0.db" -s 64M -p "$PORT4" -q -C "127.0.0.1:9,127.0.0.1:8" \
+     -N 0 >>"$DIR/log" 2>&1; then
+	bad "mismatched seed is refused" "started anyway"
+else
+	ok "mismatched seed is refused"
+fi
+
+kill "$pid4" "$pid5" 2>/dev/null; wait "$pid4" 2>/dev/null; wait "$pid5" 2>/dev/null
+pid4=; pid5=
+
 
 echo
 if [ "$fails" -eq 0 ]; then
