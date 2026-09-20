@@ -1,0 +1,111 @@
+# kache - the autoscaling shape, on a laptop.
+#
+#     docker compose -f deploy/compose.scale.yml up --build -d --scale kache=3
+#     docker compose -f deploy/compose.scale.yml exec client sh
+#
+# This rig is the local stand-in for a Deployment behind a HorizontalPod-
+# Autoscaler, and it is arranged so the things that break in that
+# environment can break here too.
+#
+#   * The nodes are replicas of one service, not three named containers.
+#     They have no fixed index, no fixed address and no fixed port, which
+#     is exactly what a pod has.  `--scale kache=N` is the HPA.
+#
+#   * Membership is the DNS name `kache`, which the container runtime
+#     resolves to one A record per running replica - the same contract a
+#     headless Service gives in Kubernetes.  Scale the service and the
+#     answer changes; nothing is reconfigured and nothing is restarted.
+#
+#   * There is no load balancer.  There does not need to be one: a client
+#     asks the service name, DNS hands it whichever replica, and if that
+#     replica does not own the key it answers 307 naming the one that
+#     does.  That is what a ClusterIP Service does in Kubernetes, and
+#     what kache-lb cannot do here, because its backend list is fixed at
+#     startup and these backends are not.
+#
+# Test from inside the network, via the `client` container.  A redirect
+# names a container address, which is routable on this network and is not
+# routable from the host - the same reason a sharded kache is an
+# in-cluster service in Kubernetes and not an internet facing one.
+#
+# One thing this rig cannot reproduce.  Compose DNS lists every running
+# container whatever its healthcheck says, so a draining node stays in the
+# membership until it exits - there is no readiness gate here.  Kubernetes
+# withdraws the A record when the readiness probe fails, which is what
+# moves traffic off a pod *before* it stops answering; see -Q and the
+# probe timings in deploy/k8s/kache.yaml.  Here, the drain still answers
+# what is in flight, but peers keep being pointed at the node until it
+# goes, and there is a sub-second window afterwards where a redirect can
+# name an address that has just stopped listening.  That window is an
+# artefact of the rig, not of kache.
+
+services:
+  kache:
+    build:
+      context: ..
+      dockerfile: Containerfile
+    restart: unless-stopped
+    # No container_name and no host port: both are unique per container
+    # and a service that can be scaled cannot have either.
+    tmpfs:
+      - /data:mode=1777
+    command:
+      - "-f"
+      - "/data/kache.db"
+      - "-s"
+      - "${STORE_SIZE:-256M}"
+      - "-p"
+      - "7070"
+      - "-l"
+      - "0.0.0.0"
+      # Ephemeral store: a replica always starts empty, which is what a
+      # pod on an emptyDir does and what makes a spot kill cost nothing
+      # but a cold cache.
+      - "-n"
+      # Shard over whatever `kache` resolves to, re-checked every second
+      # so a scale event is picked up promptly on a rig being poked by
+      # hand.  The Kubernetes default of 2s is fine for a real cluster.
+      - "-J"
+      - "kache"
+      - "-D"
+      - "1000"
+      # Fail readiness but keep answering for 2s after SIGTERM, so the
+      # requests already in flight finish.  Compose's stop_grace_period
+      # below has to be longer than this or it is SIGKILL that decides.
+      - "-Q"
+      - "2000"
+    stop_grace_period: 10s
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:7070/ready"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+
+  # The balancer, in front of the same scaling service.  One -b name now
+  # expands to every address it resolves to and is re-resolved each health
+  # cycle, so replicas added and removed are picked up without restarting
+  # it.  It probes /ready, so a draining node leaves the rotation before
+  # it stops answering.
+  #
+  # It is not needed for sharding - a client can ask the service name and
+  # be redirected - but it is what a client outside the network has to go
+  # through, and it is the piece a non-Kubernetes deployment would use in
+  # place of a Service.
+  lb:
+    build:
+      context: ..
+      dockerfile: Containerfile
+    entrypoint: ["/usr/local/bin/kache-lb"]
+    command: ["-l", "0.0.0.0", "-p", "8080", "-b", "kache:7070", "-k", "1000"]
+    ports: ["${PORT_LB:-7080}:8080"]
+    depends_on:
+      - kache
+
+  # Somewhere to run curl from that is on the same network as the nodes,
+  # so a 307 to a container address can actually be followed.
+  client:
+    image: docker.io/library/alpine:3.20
+    command: ["sh", "-c", "apk add --no-cache curl >/dev/null 2>&1; sleep infinity"]
+    depends_on:
+      - kache

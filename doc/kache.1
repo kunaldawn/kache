@@ -357,6 +357,48 @@ it and by a once a second housekeeping tick.
 .Ql kache_reclaim_pending
 counts what is still waiting.  An allocation that cannot be met reclaims
 all of it before evicting anything a client can still read.
+.Sh AUTOSCALING
+.Fl C
+describes a cluster whose membership is fixed: ownership is the hash over
+the node count, the hash seed is derived from the list, and each node is
+told its index with
+.Fl N .
+None of that survives a pod being added, so under an autoscaler use
+.Fl J .
+.Pp
+.Fl J
+takes a name whose A records are the membership - a headless Service in
+Kubernetes, a service name under Docker Compose.  A node finds itself in
+that list by matching it against its own interfaces, or by
+.Fl I
+when it should be told instead.  The list is re-resolved every
+.Fl D
+milliseconds, so a scale event needs no reconfiguration and no restart.
+.Pp
+A key lives on its owner alone, so reads redirect as writes do and
+capacity is the sum of the nodes.  Ownership is rendezvous hashed, so a
+scale event moves the share of the keyspace that must move - about
+1/(n+1) - rather than the majority that
+.Ql hash % nodes
+would.  The hash seed comes from the cluster's name rather than its
+membership, which is what lets a node keep serving across a resize.
+.Pp
+.Fl Q
+is the drain.  On
+.Dv SIGTERM
+the node fails
+.Ql /ready
+but keeps answering for that long, so a load balancer sheds it before it
+stops.  Keep it below the orchestrator's grace period.
+.Ql /health
+stays 200 throughout, so a draining node is not restarted for draining.
+.Pp
+A request naming keys on more than one node is answered
+.Ql 409 ;
+one whose keys agree on an owner is redirected whole.
+.Fl X
+is refused with
+.Fl J .
 .Sh SECURITY
 .Nm
 has no authentication and no transport security: anything that can open a

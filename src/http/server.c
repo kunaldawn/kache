@@ -52,6 +52,7 @@ typedef struct Worker {
 #define ACCEPT_PAUSE_MS 100u
 
 static _Atomic int stopping;
+static _Atomic int draining;
 static Worker *workers;
 static unsigned nworkers;
 
@@ -233,6 +234,13 @@ worker_main(void *arg)
 			break;
 		}
 		now = now_ms();
+		/* One relaxed load a pass, rather than an atomic read inside
+		 * /ready: the handler runs under no lock and wants a plain
+		 * int, and a drain that takes effect one epoll pass late is
+		 * a few hundred microseconds against a grace period measured
+		 * in seconds. */
+		w->ctx.draining = atomic_load_explicit(&draining,
+		                                       memory_order_relaxed);
 		for (i = 0; i < n; i++) {
 			Tag *t = evs[i].data.ptr;
 
@@ -335,6 +343,7 @@ server_run(Db *db, const ServerCfg *cfg)
 		w->ctx.default_ttl = cfg->default_ttl;
 		w->ctx.started = began;
 		w->ctx.allow_flush = cfg->allow_flush;
+		w->ctx.sharded = cfg->sharded;
 		w->ctx.minimal = cfg->minimal;
 		w->ctx.cl = cfg->cl;
 		w->ctx.max_req = (size_t)db->map.maxval + CFG_REQ_SLACK;
@@ -369,6 +378,31 @@ server_run(Db *db, const ServerCfg *cfg)
 	     nworkers);
 	if (sigwait(&set, &sig) != 0)
 		warn("sigwait:");
+
+	/* Shutdown in two steps, because a pod is removed from a load
+	 * balancer by a probe rather than by exiting, and the probe cannot
+	 * notice something that has already happened.  Step one fails
+	 * readiness and keeps serving: the Service drops this endpoint, a
+	 * sharded peer's next resolve stops listing it, and the traffic
+	 * already in flight still gets answered.  Step two stops.
+	 *
+	 * Without the pause, every request in flight at SIGTERM becomes a
+	 * connection reset - which under an autoscaler or a spot
+	 * preemption is not a rare event, it is every scale-in.  The wait
+	 * has to be shorter than the grace period, or the kernel makes the
+	 * decision with SIGKILL instead. */
+	if (cfg->drain_ms) {
+		struct timespec nap;
+
+		info("draining for %llums before shutting down",
+		     (unsigned long long)cfg->drain_ms);
+		atomic_store_explicit(&draining, 1, memory_order_relaxed);
+		for (i = 0; i < nworkers; i++)
+			wake(&workers[i]);
+		nap.tv_sec = (time_t)(cfg->drain_ms / 1000);
+		nap.tv_nsec = (long)(cfg->drain_ms % 1000) * 1000000L;
+		nanosleep(&nap, NULL);
+	}
 	info("shutting down");
 	atomic_store_explicit(&stopping, 1, memory_order_relaxed);
 

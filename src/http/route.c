@@ -236,35 +236,112 @@ hot_ok(const Ctx *c, const Req *r, int ka, const Key *k)
  * peer turns into this node's queue; a redirect hands the decision back
  * to the client, which can also remember it and stop guessing wrong.
  * 307 is the one that preserves the method and the body. */
+/* Answer this request with a 307 naming another node.  Always returns 1,
+ * so a caller can `return redirect_to(...)` from a test. */
 static int
-elsewhere(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
+redirect_to(Ctx *c, const Req *r, Buf *out, int ka, const char *owner)
 {
 	char loc[512];
-	unsigned owner;
-	u64 h;
 	size_t n;
 	Hdrs hd;
 
-	if (!c->cl)
-		return 0;
-	h = hash_bytes(k->c, k->n, c->db->map.seed);
-	if (cl_is_mine(c->cl, h))
-		return 0;
-	owner = cl_owner(c->cl, h);
 	/* The path is echoed back exactly as it arrived, still percent
 	 * encoded, so a key that needed escaping stays escaped. */
 	n = (size_t)snprintf(loc, sizeof(loc), "http://%s%.*s%s%.*s",
-	    cl_client_addr(c->cl, owner), (int)r->path.n, r->path.p,
+	    owner, (int)r->path.n, r->path.p,
 	    r->query.n ? "?" : "", (int)r->query.n, r->query.p);
 	if (n >= sizeof(loc)) {
 		fail(c, out, 414, ka, "redirect target too long");
 		return 1;
 	}
+	st_inc(&c->st->redirects);
 	hdrs_start(&hd, 307, clk_date(), c->minimal_req);
 	hdrs_add(&hd, "Location", loc, n);
 	hdrs_end(&hd, 0, ka);
 	buf_put(out, hd.b, hd.n);
 	return 1;
+}
+
+static int
+elsewhere(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
+{
+	char owner[256];
+	u64 h;
+
+	if (!c->cl)
+		return 0;
+	h = hash_bytes(k->c, k->n, c->db->map.seed);
+	/* One call, so the owner and the address it resolves to come from
+	 * one snapshot of the membership.  Under -J that list moves while
+	 * requests are in flight, and an index looked up against one
+	 * version and an address against the next names the wrong node. */
+	if (!cl_route(c->cl, h, owner, sizeof owner))
+		return 0;
+	return redirect_to(c, r, out, ka, owner);
+}
+
+/* Does this node hold this key?  Always yes unless sharding says
+ * otherwise. */
+static int
+owns(Ctx *c, const void *k, u32 kl)
+{
+	char ignored[256];
+	u64 h;
+
+	if (!c->sharded)
+		return 1;
+	h = hash_bytes(k, kl, c->db->map.seed);
+	return !cl_route(c->cl, h, ignored, sizeof ignored);
+}
+
+/* Where a request naming several keys belongs.
+ *
+ * One Location can only name one node, so a batch is answerable exactly
+ * when its keys agree on an owner.  When they do it is an ordinary
+ * request that happens to carry several keys, and it is served or
+ * redirected like any other.  When they do not, no single answer is
+ * truthful - and half answering would let a caller read a key that lives
+ * on another node as a key that does not exist - so it is refused.  This
+ * is the same distinction Redis Cluster draws between MOVED and
+ * CROSSSLOT, for the same reason. */
+typedef struct Home {
+	char addr[256];   /* empty while the keys seen are this node's */
+	int  seen;
+	int  split;       /* the keys name more than one node */
+} Home;
+
+static void
+home_add(Ctx *c, Home *h, const void *k, u32 kl)
+{
+	char a[256];
+	u64 hash;
+
+	if (!c->sharded || h->split)
+		return;
+	a[0] = '\0';
+	hash = hash_bytes(k, kl, c->db->map.seed);
+	cl_route(c->cl, hash, a, sizeof a);   /* left empty when it is ours */
+	if (!h->seen) {
+		snprintf(h->addr, sizeof h->addr, "%s", a);
+		h->seen = 1;
+	} else if (strcmp(h->addr, a)) {
+		h->split = 1;
+	}
+}
+
+/* 0 to go ahead, 1 when the batch has been answered (redirected or
+ * refused) and the caller should return. */
+static int
+home_settle(Ctx *c, const Req *r, Buf *out, int ka, const Home *h)
+{
+	if (h->split) {
+		fail(c, out, 409, ka,
+		     "batch spans nodes; group keys by owner");
+		return 1;
+	}
+	if (!h->seen || !h->addr[0])
+		return 0;
+	return redirect_to(c, r, out, ka, h->addr);
 }
 
 /* Tell the flusher this node changed a key.  Called after the write has
@@ -590,7 +667,7 @@ collect(Ctx *c, Metric *mt, size_t cap)
 {
 	enum { REQ, HIT, MISS, SET, DEL, INCR, CAT, TOUCH, ERR,
 	       ACCEPT, CLOSE, CUR, BIN, BOUT,
-	       KKVR, KKVW, KKVD, QPUSH, QPOP, HOTH, HOTF };
+	       KKVR, KKVW, KKVD, QPUSH, QPOP, HOTH, HOTF, REDIR };
 	u64 s[STATS_FIELDS];
 	DbStats d;
 	size_t n = 0;
@@ -630,11 +707,19 @@ collect(Ctx *c, Metric *mt, size_t cap)
 	M("queue_pushes_total", "counter", s[QPUSH]);
 	M("queue_pops_total", "counter", s[QPOP]);
 	if (c->cl) {
-		u64 sent, recvd, failed;
+		u64 sent, recvd, failed, resolves, changes;
 
 		cl_stats(c->cl, &sent, &recvd, &failed);
+		cl_discovery(c->cl, &resolves, &changes);
 		M("cluster_nodes", "gauge", cl_nodes(c->cl));
 		M("cluster_self", "gauge", cl_self(c->cl));
+		M("cluster_sharded", "gauge", c->sharded);
+		M("redirects_total", "counter", s[REDIR]);
+		/* How often the member list was looked up, and how often it
+		 * had actually moved.  The gap between them is the cluster
+		 * sitting still; changes climbing is an autoscaler at work. */
+		M("discovery_resolves_total", "counter", resolves);
+		M("discovery_changes_total", "counter", changes);
 		/* Frames shipped, not writes taken.  The gap between this
 		 * and sets_total is the coalescing doing its job, and it is
 		 * the number to look at when peer traffic is a worry. */
@@ -652,7 +737,7 @@ collect(Ctx *c, Metric *mt, size_t cap)
 static void
 do_stats(Ctx *c, Buf *out, int ka, int prom)
 {
-	Metric mt[40];
+	Metric mt[48];
 	size_t n = collect(c, mt, LEN(mt)), i;
 	size_t mark = out->len;
 	Hdrs h;
@@ -756,8 +841,15 @@ static void do_q_move(Ctx *c, const Req *r, Buf *out, int ka, const Key *k);
 static void do_q_trim(Ctx *c, const Req *r, Buf *out, int ka, const Key *k);
 static void do_q_touch(Ctx *c, const Req *r, Buf *out, int ka, const Key *k);
 
+/* Parse the key out of the path, and in sharded mode send the request to
+ * the node that holds it.  Every key addressed endpoint comes through
+ * here, which is why the routing lives here rather than in each handler:
+ * under -J a key lives on its owner alone, so there is no operation -
+ * read, write, container or queue - that a node which does not own it
+ * can usefully perform.  Replicated mode is untouched, and keeps
+ * redirecting writes only, from the handlers that already do it. */
 static int
-key_or_fail(Ctx *c, Buf *out, int ka, Str rest, Key *k)
+key_or_fail(Ctx *c, Buf *out, int ka, const Req *r, Str rest, Key *k)
 {
 	int rc = take_key(rest, k);
 
@@ -769,6 +861,8 @@ key_or_fail(Ctx *c, Buf *out, int ka, Str rest, Key *k)
 		fail(c, out, 400, ka, "bad key");
 		return -1;
 	}
+	if (c->sharded && elsewhere(c, r, out, ka, k))
+		return -1;
 	return 0;
 }
 
@@ -788,7 +882,7 @@ route(Ctx *c, const Req *r, Buf *out, int *keepalive)
 	c->head = (r->meth == M_HEAD);
 
 	if (prefixed(r->path, "/kv/", 4, &rest)) {
-		if (key_or_fail(c, out, ka, rest, &k) < 0)
+		if (key_or_fail(c, out, ka, r, rest, &k) < 0)
 			return;
 		switch (r->meth) {
 		case M_GET:
@@ -801,13 +895,13 @@ route(Ctx *c, const Req *r, Buf *out, int *keepalive)
 		return;
 	}
 	if (prefixed(r->path, "/kkv/", 5, &rest)) {
-		if (key_or_fail(c, out, ka, rest, &k) < 0)
+		if (key_or_fail(c, out, ka, r, rest, &k) < 0)
 			return;
 		do_kkv(c, r, out, ka, &k);
 		return;
 	}
 	if (prefixed(r->path, "/q/", 3, &rest)) {
-		if (key_or_fail(c, out, ka, rest, &k) < 0)
+		if (key_or_fail(c, out, ka, r, rest, &k) < 0)
 			return;
 		do_q(c, r, out, ka, &k);
 		return;
@@ -833,7 +927,7 @@ route(Ctx *c, const Req *r, Buf *out, int *keepalive)
 		for (ci = 0; ci < LEN(cont); ci++) {
 			if (!prefixed(r->path, cont[ci].pfx, cont[ci].n, &rest))
 				continue;
-			if (key_or_fail(c, out, ka, rest, &k) < 0)
+			if (key_or_fail(c, out, ka, r, rest, &k) < 0)
 				return;
 			cont[ci].fn(c, r, out, ka, &k);
 			return;
@@ -843,7 +937,7 @@ route(Ctx *c, const Req *r, Buf *out, int *keepalive)
 		else if (prefixed(r->path, "/kkvdecr/", 9, &rest))
 			sign = -1;
 		if (sign) {
-			if (key_or_fail(c, out, ka, rest, &k) < 0)
+			if (key_or_fail(c, out, ka, r, rest, &k) < 0)
 				return;
 			do_kkv_incr(c, r, out, ka, &k, sign);
 			return;
@@ -858,7 +952,7 @@ route(Ctx *c, const Req *r, Buf *out, int *keepalive)
 		else if (prefixed(r->path, "/prepend/", 9, &rest))
 			prepend = 1;
 		if (sign || prepend >= 0) {
-			if (key_or_fail(c, out, ka, rest, &k) < 0)
+			if (key_or_fail(c, out, ka, r, rest, &k) < 0)
 				return;
 			if (sign)
 				do_incr(c, r, out, ka, &k, sign);
@@ -867,7 +961,7 @@ route(Ctx *c, const Req *r, Buf *out, int *keepalive)
 			return;
 		}
 		if (prefixed(r->path, "/touch/", 7, &rest)) {
-			if (key_or_fail(c, out, ka, rest, &k) < 0)
+			if (key_or_fail(c, out, ka, r, rest, &k) < 0)
 				return;
 			do_touch(c, r, out, ka, &k);
 			return;
@@ -882,6 +976,16 @@ route(Ctx *c, const Req *r, Buf *out, int *keepalive)
 
 			if (!c->cl) {
 				fail(c, out, 404, ka, "not in a cluster");
+				return;
+			}
+			/* Sharded, a key has one copy and this endpoint has
+			 * nothing to deliver: no node ever sends one.  Left
+			 * open it would be a way to write any key on any
+			 * node without the ownership check, which is the one
+			 * rule the whole mode rests on. */
+			if (c->sharded) {
+				fail(c, out, 404, ka,
+				     "no replication in sharded mode");
 				return;
 			}
 			if (cl_apply(c->cl, r->body.p, r->body.n,
@@ -935,6 +1039,21 @@ route(Ctx *c, const Req *r, Buf *out, int *keepalive)
 		}
 		if (r->path.n == 7 && !memcmp(r->path.p, "/health", 7)) {
 			reply_text(c, out, 200, ka, "ok", 2);
+			return;
+		}
+		/* Liveness says the process works; readiness says to send it
+		 * traffic.  They part company exactly once, at shutdown: a
+		 * node that has been told to stop is still perfectly alive
+		 * and must keep answering what is already in flight, but
+		 * wants no new work.  Failing readiness is what takes this
+		 * pod out of the Service's endpoints - and, under -J, out of
+		 * the member list its peers resolve - before it goes away,
+		 * so the traffic moves first and the pod dies second. */
+		if (r->path.n == 6 && !memcmp(r->path.p, "/ready", 6)) {
+			if (c->draining)
+				reply_text(c, out, 503, ka, "draining", 8);
+			else
+				reply_text(c, out, 200, ka, "ready", 5);
 			return;
 		}
 		if (r->path.n == 1) {
@@ -1015,6 +1134,27 @@ do_mget(Ctx *c, const Req *r, Buf *out, int ka, int del)
 	if (del && c->hot)
 		hot_dirty(c->hot);
 	mark = out->len;
+
+	/* Sharded, the keys decide the node before any of them is looked
+	 * up: a batch that belongs elsewhere is redirected whole, and one
+	 * that is split is refused without having half applied it.  The
+	 * pass costs a hash per key over a body of key names. */
+	if (c->sharded) {
+		const char *q = p;
+		Home home;
+		Str one;
+
+		memset(&home, 0, sizeof home);
+		while (batch_line(&q, end, &one)) {
+			Key hk;
+
+			if (!one.n || take_key(one, &hk) < 0)
+				continue;   /* pass two reports the error */
+			home_add(c, &home, hk.c, hk.n);
+		}
+		if (home_settle(c, r, out, ka, &home))
+			return;
+	}
 
 	while (batch_line(&p, end, &line)) {
 		DbMeta m;
@@ -1175,6 +1315,7 @@ do_mset(Ctx *c, const Req *r, Buf *out, int ka)
 	MRec rec;
 	Hdrs h;
 	i64 ttl;
+	Home home;
 	u32 flags, n = 0, stored = 0;
 	int rc, toomany = 0;
 
@@ -1196,7 +1337,9 @@ do_mset(Ctx *c, const Req *r, Buf *out, int ka)
 
 	/* Pass one parses the whole body without touching the store.  A
 	 * batch cannot be applied atomically, but it can at least be
-	 * rejected atomically, so a malformed one changes nothing. */
+	 * rejected atomically, so a malformed one changes nothing - and it
+	 * is also where the batch's owner is settled, for the same reason. */
+	memset(&home, 0, sizeof home);
 	p = r->body.p;
 	while ((rc = batch_record(&p, end, ttl, &rec, &why)) == 1) {
 		if (++n > CFG_BATCH_MAX) {
@@ -1210,11 +1353,14 @@ do_mset(Ctx *c, const Req *r, Buf *out, int ka)
 			rc = -1;
 			break;
 		}
+		home_add(c, &home, rec.k.c, rec.k.n);
 	}
 	if (rc < 0) {
 		fail(c, out, toomany ? 413 : 400, ka, why);
 		return;
 	}
+	if (home_settle(c, r, out, ka, &home))
+		return;
 
 	p = r->body.p;
 	while (batch_record(&p, end, ttl, &rec, &why) == 1) {
@@ -1807,7 +1953,9 @@ static void
 do_kkv(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
 {
 	Key f;
-	int has = take_field(r, &f);
+	int has;
+
+	has = take_field(r, &f);
 
 	if (has == -2) {
 		fail(c, out, 414, ka, "field too long");
@@ -2272,6 +2420,17 @@ do_q_move(Ctx *c, const Req *r, Buf *out, int ka, const Key *k)
 	if ((from = take_side(r, "from", Q_LEFT)) < 0 ||
 	    (to = take_side(r, "to", Q_RIGHT)) < 0) {
 		fail(c, out, 400, ka, "from and to must be l or r");
+		return;
+	}
+	/* The move is atomic because one node holds both queues under both
+	 * locks.  Sharded, the destination may live on another node, and
+	 * there is no honest way to do it from here: the entry would have
+	 * to leave this node and arrive on that one with nothing holding
+	 * the two together.  Refusing is the only answer that does not
+	 * quietly stop being the primitive it is sold as. */
+	if (!owns(c, dst.c, dst.n)) {
+		fail(c, out, 409, ka,
+		     "source and destination are on different nodes");
 		return;
 	}
 	memset(&ci, 0, sizeof(ci));

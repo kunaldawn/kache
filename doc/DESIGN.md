@@ -294,6 +294,60 @@ What this does not do yet is listed honestly in README.md: containers
 are not replicated, batch writes are not routed, and a node that is down
 is retried rather than failed over.
 
+Sharding
+--------
+
+`-C` assumes its membership is fixed, and every part of it does: the
+seed comes from the member list, ownership is the hash over the node
+count, and each node is told its index.  Under an autoscaler all three
+break at once.  A node cannot reopen the store it was serving a second
+ago, because the seed moved with the list.  `hash % nodes` moves 87% of
+the keyspace on a seven to eight scale, and every moved key is a miss.
+And a pod has no index to be told.
+
+`-J` is the same store and the same front end with those three
+assumptions removed.
+
+*Membership is a name.*  Whatever the `-J` name resolves to is the
+cluster - one A record per live endpoint, which is what a headless
+Service publishes in Kubernetes and what a service name gives under
+Docker Compose.  A background thread re-reads it every `-D`
+milliseconds.  A node finds itself in that list by matching it against
+its own interfaces, so nothing has to know its index, and the list is
+sorted before use because a resolver is free to shuffle it and two nodes
+sorting differently would disagree about everything.
+
+*The seed is the cluster's name.*  Not its membership, which is the
+whole point: the name does not change when a pod is added, so a store
+outlives a resize.
+
+*Ownership is rendezvous hashed, per bucket.*  Each of 65,536 buckets
+goes to the node scoring highest for it, which moves the 1/(n+1) that
+has to move and no more.  Evaluating that per request would be O(nodes),
+so it is evaluated when the membership changes and left behind as a
+plain array: routing a key is one indexed load, against a division for
+`% nodes`.  Measured, 0.47ns against 6.01ns - which is why sharded mode
+can afford to route reads as well as writes and still cost less than the
+replicated mode's arithmetic did.
+
+The membership a request reads is a snapshot, published by a release
+store into one of two slots and taken by an acquire load - the same flip
+`clk.c` uses for its formatted date, and safe for the same reason: a
+reader holds one for the few hundred nanoseconds it takes to look up a
+bucket and copy an address, while the writer runs once every `-D`.  That
+is also why a key is resolved straight to an address in one call rather
+than to an index that is looked up separately; an index resolved against
+one membership and an address against the next names the wrong node.
+
+A key lives on its owner and nowhere else, so a read that lands
+elsewhere has nothing to answer from and is redirected like a write.
+That redirect is emitted from one place, where the key is parsed out of
+the path, rather than from each handler - there is no operation a node
+which does not own a key can usefully perform.  A request naming several
+keys is the exception that proves it: one `Location` names one node, so
+a batch is redirected whole when its keys agree on an owner and refused
+when they do not.
+
 The front end
 -------------
 
@@ -560,9 +614,14 @@ polls, or holds a connection open and pops a batch.
 against a network round trip, and buys every client library, proxy and
 debugging tool that already exists.
 
-*Replication and clustering.*  A cache node that can be lost is a much
-simpler thing than one that cannot, and the client already has to handle a
-miss.
+*Data migration on a resize.*  A sharded cluster moves ownership when its
+membership changes, and the keys that moved are misses until they are
+written again.  Nothing copies them to their new owner.  Rendezvous
+hashing is what makes that affordable - it moves the 1/(n+1) of the
+keyspace that has to move rather than the majority `hash % nodes` would -
+but a resize still costs that share of the cache.  Migrating it would mean
+a node streaming records to another while both serve, and a cache whose
+misses are already cheap does not need it.
 
 *Compression and serialisation.*  Values are bytes.  The caller knows what
 they mean and kache does not need to.

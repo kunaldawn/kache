@@ -132,6 +132,19 @@
  * trip. */
 #define CFG_REPL_MS          50u
 
+/* How often a sharded node re-resolves its -J name to find out who its
+ * peers are now.  This is the whole reaction time of the cluster to a
+ * scale event: a pod that appears is routed to within this long, and a
+ * pod that goes away stops being redirected to within it.  Kubernetes
+ * withdraws a pod's A record when its readiness probe fails, so the DNS
+ * answer leads the pod's departure rather than trailing it, which is
+ * what makes a short interval useful rather than merely busy.
+ *
+ * A resolve that finds the same members costs one getaddrinfo and
+ * nothing else - the owner table is only rebuilt when the membership
+ * actually moved. */
+#define CFG_RESOLVE_MS       2000u
+
 /* ---- eviction ------------------------------------------------------- */
 
 /* candidates inspected per eviction; larger is a better LRU approximation */

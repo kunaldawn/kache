@@ -12,6 +12,7 @@ pid2=
 pid3=
 pid4=
 pid5=
+pid6=
 
 cleanup() {
 	[ -n "$pid" ] && kill "$pid" 2>/dev/null
@@ -24,6 +25,8 @@ cleanup() {
 	wait "$pid4" 2>/dev/null
 	[ -n "$pid5" ] && kill "$pid5" 2>/dev/null
 	wait "$pid5" 2>/dev/null
+	[ -n "$pid6" ] && kill "$pid6" 2>/dev/null
+	wait "$pid6" 2>/dev/null
 	rm -rf "$DIR"
 }
 trap cleanup EXIT INT TERM
@@ -662,6 +665,98 @@ fi
 kill "$pid4" "$pid5" 2>/dev/null; wait "$pid4" 2>/dev/null; wait "$pid5" 2>/dev/null
 pid4=; pid5=
 
+
+# ---- sharding and draining ------------------------------------------
+#
+# The membership of a sharded cluster is a DNS name, and on one host only
+# one node can answer for a name, so what is checked here is everything
+# that does not need several of them: that a lone node owns the whole
+# keyspace and serves normally, that readiness and liveness part company
+# at shutdown, and that the flag combinations which cannot work are
+# refused rather than half honoured.  The multi node behaviour - the
+# split keyspace, the redirects and what a scale event costs - is the
+# container rig in deploy/compose.scale.yml, which is the only place
+# several nodes can have several addresses.
+echo "sharding"
+
+PORT6=$((PORT + 6))
+"$BIN" -f "$DIR/s0.db" -s 64M -p "$PORT6" -q -n -J localhost -G testcluster \
+	-D 500 -Q 400 >>"$DIR/log" 2>&1 &
+pid6=$!
+i=0
+while ! curl -sS -m 1 -o /dev/null "http://127.0.0.1:$PORT6/health" 2>/dev/null
+do
+	i=$((i + 1))
+	[ "$i" -gt 50 ] && break
+	sleep 0.1
+done
+
+SURL="http://127.0.0.1:$PORT6"
+check "sharded node is live"   200 "$SURL/health"
+check "sharded node is ready"  200 "$SURL/ready"
+# The only member, so it owns every key and nothing is redirected.
+check "sole member owns its keys" 201 -X PUT -d v "$SURL/kv/shardkey"
+body  "sole member serves reads" "v" "$SURL/kv/shardkey"
+check "sole member takes a batch" 200 -X POST --data-binary "shardkey" \
+	"$SURL/mget"
+has "sharded node reports itself" "$(curl -sS -m 5 "$SURL/stats")" \
+	"^cluster_sharded 1"
+has "membership was resolved" "$(curl -sS -m 5 "$SURL/stats")" \
+	"^discovery_resolves_total [1-9]"
+# Sharded, nothing replicates, so the peer endpoint has nothing to carry -
+# and left open it would write any key on any node without the ownership
+# check that the whole mode rests on.
+check "sharded refuses /x/repl" 404 -X POST -d "" "$SURL/x/repl"
+
+# SIGTERM starts the drain: readiness fails so a balancer sheds this node,
+# liveness holds so nothing restarts it for draining, and it keeps
+# answering until the window closes.
+kill -TERM "$pid6" 2>/dev/null
+sleep 0.15
+check "draining fails readiness" 503 "$SURL/ready"
+check "draining stays live"      200 "$SURL/health"
+check "draining still answers"   200 "$SURL/kv/shardkey"
+wait "$pid6" 2>/dev/null
+pid6=
+if curl -sS -m 1 -o /dev/null "$SURL/health" 2>/dev/null; then
+	bad "drain ends in a shutdown" "still listening"
+else
+	ok "drain ends in a shutdown"
+fi
+
+# Combinations that cannot mean anything must be refused at startup, not
+# resolved into one of the two readings.
+if "$BIN" -f "$DIR/s1.db" -s 64M -p "$PORT6" -q -n -J localhost \
+     -C 127.0.0.1:9,127.0.0.1:8 >>"$DIR/log" 2>&1; then
+	bad "-C with -J is refused" "started anyway"
+else
+	ok "-C with -J is refused"
+fi
+if "$BIN" -f "$DIR/s2.db" -s 64M -p "$PORT6" -q -n -J localhost -X 100 \
+     >>"$DIR/log" 2>&1; then
+	bad "-X with -J is refused" "started anyway"
+else
+	ok "-X with -J is refused"
+fi
+
+# The seed is the cluster's name under -J, so a store outlives a change of
+# membership - which is the whole reason an autoscaled node can keep the
+# cache it had a moment ago.
+"$BIN" -f "$DIR/s3.db" -s 64M -p "$PORT6" -q -n -J localhost -G stable \
+	>>"$DIR/log" 2>&1 &
+pid6=$!
+sleep 0.6
+kill -KILL "$pid6" 2>/dev/null; wait "$pid6" 2>/dev/null; pid6=
+"$BIN" -f "$DIR/s3.db" -s 64M -p "$PORT6" -q -J localhost -G stable \
+	>>"$DIR/log" 2>&1 &
+pid6=$!
+sleep 0.6
+if curl -sS -m 1 -o /dev/null "http://127.0.0.1:$PORT6/health" 2>/dev/null; then
+	ok "store survives a membership change"
+else
+	bad "store survives a membership change" "did not reopen its store"
+fi
+kill "$pid6" 2>/dev/null; wait "$pid6" 2>/dev/null; pid6=
 
 echo
 if [ "$fails" -eq 0 ]; then

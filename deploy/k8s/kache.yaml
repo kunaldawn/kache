@@ -1,0 +1,247 @@
+# kache - sharded, autoscaled, on GKE or EKS.
+#
+#     kubectl apply -f deploy/k8s/kache.yaml
+#
+# The shape, and why each piece is here:
+#
+#   Deployment          pods with no stable identity, which is what an
+#                       HPA requires and what a StatefulSet would deny.
+#   Service kache-peers headless.  Its A records are the membership: one
+#                       per ready pod, withdrawn the moment readiness
+#                       fails.  This is what -J resolves.
+#   Service kache       ClusterIP, for clients.  Hands a client any pod;
+#                       that pod redirects to the owner.
+#   HPA                 scales on CPU.  See the note on memory below.
+#   PodDisruptionBudget keeps a drain or a node upgrade from taking the
+#                       whole cache at once.
+#
+# The store is an emptyDir and every pod starts with -n, so a pod is
+# always born empty.  That is the right trade for a cache on spot
+# capacity: there is nothing on disk to corrupt when a node is reclaimed
+# without warning, nothing to recover on start, and the only cost of
+# losing a pod is the share of the keyspace it held.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kache-peers
+  labels: { app: kache }
+spec:
+  # Headless: no virtual IP, just one A record per ready endpoint.  That
+  # list *is* the cluster membership, which is why the pods resolve this
+  # name rather than being handed a list of addresses they would have to
+  # be restarted to change.
+  clusterIP: None
+  # Unready endpoints are deliberately NOT published, which is what makes
+  # a drain work: readiness fails, the record is withdrawn, and within one
+  # -D interval the peers have stopped redirecting to this pod and the pod
+  # itself has stopped claiming a share.  It sheds traffic from both ends
+  # before it stops answering.
+  #
+  # The cost is that a starting pod does not find itself in the list for
+  # its first resolve, so for up to -D it owns nothing and redirects
+  # everything to the pods that are already serving.  That is a correct
+  # answer and an extra hop, and it converges without coordination - a far
+  # better trade than keeping a dying pod in the membership.
+  selector: { app: kache }
+  ports:
+    - name: http
+      port: 7070
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kache
+  labels: { app: kache }
+spec:
+  type: ClusterIP
+  selector: { app: kache }
+  ports:
+    - name: http
+      port: 7070
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kache
+  labels: { app: kache }
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: kache }
+  strategy:
+    rollingUpdate:
+      # One pod at a time, and never below the running count: a rolling
+      # update is a sequence of scale events to the keyspace, and taking
+      # two pods out at once moves twice as much of it at once.
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels: { app: kache }
+    spec:
+      # Longer than -Q, or SIGKILL arrives mid-drain and the in-flight
+      # requests become connection resets after all.
+      terminationGracePeriodSeconds: 30
+      # Spread across nodes and zones, so losing one spot node does not
+      # take a disproportionate share of the keyspace with it.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: kache }
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: kache }
+      containers:
+        - name: kache
+          # Replace with your registry path - gcr.io/PROJECT/kache:TAG on
+          # GKE, ACCOUNT.dkr.ecr.REGION.amazonaws.com/kache:TAG on EKS.
+          # Pin a tag rather than tracking :latest: a rolling update to a
+          # sharded cache moves a share of the keyspace per pod replaced,
+          # and that should happen when you decide it does.
+          image: kache:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "-f"
+            - "/data/kache.db"
+            # Must stay under the memory limit below, with room for the
+            # connection buffers.  The store is mmap'd and its pages count
+            # against the container, so a store sized at the limit is an
+            # OOMKill waiting for the cache to fill.
+            - "-s"
+            - "768M"
+            - "-p"
+            - "7070"
+            - "-l"
+            - "0.0.0.0"
+            - "-n"
+            - "-J"
+            - "kache-peers.$(POD_NAMESPACE).svc.cluster.local"
+            # Interface matching finds the pod's own address unaided on a
+            # normal CNI; passing it explicitly costs nothing and removes
+            # the assumption.
+            - "-I"
+            - "$(POD_IP)"
+            # How quickly a scale event is noticed.  Worth checking
+            # against your cluster's DNS: NodeLocal DNSCache is on by
+            # default on GKE and caches with a TTL, and CoreDNS publishes
+            # its own, either of which stacks on top of this.  Convergence
+            # is the sum, not the larger, so if membership changes seem
+            # slow, look at the TTL before lowering this.
+            - "-D"
+            - "2000"
+            - "-Q"
+            - "10000"
+          env:
+            - name: POD_IP
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+          ports:
+            - name: http
+              containerPort: 7070
+          resources:
+            requests: { cpu: "500m", memory: "1Gi" }
+            limits:   { memory: "1Gi" }
+          # Liveness asks whether the process is broken; it stays 200
+          # through a drain, so a draining pod is not restarted for
+          # draining.
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          # Readiness decides where traffic goes, and here it also decides
+          # the cluster membership, because the headless Service drops an
+          # unready pod.  The timings are a chain and -Q has to outlast
+          # all of it:
+          #
+          #   SIGTERM -> /ready fails immediately
+          #   + up to periodSeconds * failureThreshold  (3s) to be noticed
+          #   + endpoint withdrawn, peers re-resolve at -D (2s)
+          #   = ~5s before nothing is routed here any more
+          #
+          # -Q 10000 leaves double that, and sits well inside the 30s
+          # grace period.  failureThreshold stays above 1 on purpose: a
+          # single slow probe must not flap a pod out of the membership,
+          # because every flap moves a share of the keyspace twice.
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            periodSeconds: 1
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # Slow starts are not a thing here - the store is created empty
+          # - but a startup probe keeps a slow scheduler from being read
+          # as a liveness failure.
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 1
+            failureThreshold: 30
+          volumeMounts:
+            - { name: store, mountPath: /data }
+      volumes:
+        - name: store
+          # tmpfs: the store is the cache, so it belongs in RAM rather
+          # than on a disk the pages would be written back to.  Its pages
+          # are charged to the pod's cgroup, which is why sizeLimit and -s
+          # both sit below the memory limit rather than at it.
+          emptyDir: { medium: Memory, sizeLimit: 800Mi }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kache
+spec:
+  # Voluntary disruptions only - node drains, upgrades.  A spot
+  # reclamation is involuntary and ignores this, which is why the pods
+  # are spread across nodes and zones above.
+  maxUnavailable: 1
+  selector:
+    matchLabels: { app: kache }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: kache
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: kache
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    # Memory is deliberately absent.  See the note in README's
+    # "Autoscaling" section: a cache fills the arena it was given and
+    # then holds it, so memory utilisation rises to a plateau and stays
+    # there whatever the load is.  Scaling on it produces a ratchet that
+    # only ever goes up, because adding a pod does not lower the memory
+    # of the pods that already filled theirs.  Size -s against the limit
+    # and scale on CPU, which does track load.
+  behavior:
+    scaleDown:
+      # Every scale-in moves a share of the keyspace and costs those keys
+      # as misses.  Descending slowly is worth more here than reacting
+      # quickly to a dip.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 30

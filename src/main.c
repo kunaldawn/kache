@@ -21,6 +21,7 @@ static const char usage_text[] =
 "             [-S shards] [-t threads] [-c conns] [-e ttl] [-y ms]\n"
 "             [-i idle] [-b backlog] [-B bytes] [-K bytes] [-V bytes]\n"
 "             [-X ms] [-C nodes] [-N index] [-Y ms] [-U addrs]\n"
+"             [-J name] [-I addr] [-D ms] [-G name] [-Q ms]\n"
 "\n"
 "  -l addr    address to listen on          (default " CFG_ADDR ")\n"
 "  -p port    port to listen on             (default " CFG_PORT ")\n"
@@ -46,6 +47,11 @@ static const char usage_text[] =
 "  -N index   this node's position in that list      (default 0)\n"
 "  -Y ms      replication flush interval            (default 50)\n"
 "  -U addrs   addresses clients should use, same order as -C\n"
+"  -J name    shard over whatever this DNS name resolves to\n"
+"  -D ms      how often to re-resolve -J                 (default 2000)\n"
+"  -I addr    this node's own address    (default: match an interface)\n"
+"  -G name    cluster name, the shared hash seed  (default the -J name)\n"
+"  -Q ms      fail /ready but keep serving this long after SIGTERM\n"
 "  -A         pin each worker to one cpu\n"
 "  -F         enable POST /flush\n"
 "  -q         quiet\n"
@@ -54,6 +60,16 @@ static const char usage_text[] =
 "\n"
 "Geometry (size, shards, key and value limits) is fixed when the file is\n"
 "created; reopening an existing store keeps it.  Use -n to change it.\n"
+"\n"
+"-J is the autoscaling shape.  Members are whatever the name resolves to\n"
+"- a headless Service in Kubernetes, a service name under Docker Compose\n"
+"- and a node finds itself in that list by its own addresses, so nothing\n"
+"needs to know its index.  A key lives on its owner alone, so capacity is\n"
+"the sum of the pods and a pod added under memory pressure relieves it.\n"
+"Reads redirect the same way writes do.  Ownership is rendezvous hashed,\n"
+"so a scale event moves the 1/n of the keyspace that has to move rather\n"
+"than the 87% that -C arithmetic would.  Use -Q so a pod fails readiness\n"
+"and drains before it stops answering; it must be under the grace period.\n"
 "\n"
 "With -C every node keeps a copy of every key, so a read is answered\n"
 "locally by whichever node it reaches.  A key's writes belong to one\n"
@@ -103,6 +119,7 @@ main(int argc, char *argv[])
 	Db db;
 	ClusterCfg cc;
 	Cluster *cl = NULL;
+	const char *cluster_name = NULL;
 	u64 ttl_sec = 0, idle_sec = CFG_IDLE_MS / 1000;
 	int opt;
 
@@ -116,6 +133,7 @@ main(int argc, char *argv[])
 
 	memset(&cc, 0, sizeof(cc));
 	cc.flush_ms = CFG_REPL_MS;
+	cc.mode = CL_REPLICA;
 
 	memset(&sc, 0, sizeof(sc));
 	sc.addr = CFG_ADDR;
@@ -129,7 +147,7 @@ main(int argc, char *argv[])
 	sc.affinity = CFG_AFFINITY;
 	sc.hot_ms = CFG_HOT_MS;
 
-	while ((opt = getopt(argc, argv, "l:p:f:s:S:t:c:e:y:i:b:B:K:V:X:C:N:Y:U:mPHnMAFqvh")) != -1) {
+	while ((opt = getopt(argc, argv, "l:p:f:s:S:t:c:e:y:i:b:B:K:V:X:C:N:Y:U:J:D:G:Q:I:mPHnMAFqvh")) != -1) {
 		switch (opt) {
 		case 'l': sc.addr = optarg; break;
 		case 'p': sc.port = optarg; break;
@@ -155,6 +173,11 @@ main(int argc, char *argv[])
 		case 'N': cc.self = (unsigned)must_num(optarg, "-N"); break;
 		case 'Y': cc.flush_ms = must_num(optarg, "-Y"); break;
 		case 'U': cc.advertise = optarg; break;
+		case 'J': cc.discover = optarg; cc.mode = CL_SHARD; break;
+		case 'I': cc.self_addr = optarg; break;
+		case 'D': cc.resolve_ms = must_num(optarg, "-D"); break;
+		case 'G': cluster_name = optarg; break;
+		case 'Q': sc.drain_ms = must_num(optarg, "-Q"); break;
 		case 'A': sc.affinity = 1; break;
 		case 'F': sc.allow_flush = 1; break;
 		case 'q': verbosity(0); break;
@@ -192,18 +215,51 @@ main(int argc, char *argv[])
 	 * than serving a keyspace its peers disagree about.  The list is
 	 * also the thing that must not differ, so tying the two together
 	 * turns a silent misconfiguration into a startup failure. */
-	if (cc.peers) {
+	/* What the seed is derived from is the difference between a cluster
+	 * that can be resized and one that cannot.  Deriving it from the
+	 * member list, as -C does, means the seed changes the moment the
+	 * membership does - and then every node refuses the store it was
+	 * serving a second ago, because map_open rightly will not open a
+	 * file whose keys were hashed with a different seed.  That is
+	 * survivable when the list is fixed for the life of the cluster.
+	 * Under an autoscaler it means every scale event wipes every cache.
+	 *
+	 * So -J seeds from the cluster's name instead: the -J name itself,
+	 * which every pod is given identically and which does not change
+	 * when a pod is added.  -G overrides it for the case of two
+	 * clusters sharing one name. */
+	if (cluster_name)
+		mc.seed = hash_bytes(cluster_name, strlen(cluster_name),
+		                     0x6b61636865ull);
+	else if (cc.mode == CL_SHARD && cc.discover)
+		mc.seed = hash_bytes(cc.discover, strlen(cc.discover),
+		                     0x6b61636865ull);
+	else if (cc.peers)
 		mc.seed = hash_bytes(cc.peers, strlen(cc.peers),
 		                     0x6b61636865ull);
-		if (!mc.seed)
-			mc.seed = 1;   /* 0 means "no seed asked for" */
-	}
+	if (!mc.seed && (cluster_name || cc.discover || cc.peers))
+		mc.seed = 1;   /* 0 means "no seed asked for" */
+
 	if (cc.advertise && !cc.peers)
 		die("-U names the client facing address of each -C node, so "
 		    "it means nothing without -C");
+	if (cc.peers && cc.discover)
+		die("-C names a fixed set of nodes and -J discovers them; "
+		    "use one or the other");
 	if (cc.peers && !cc.flush_ms)
 		die("-Y must be at least 1ms: it is the coalescing window "
 		    "that keeps peer traffic independent of the write rate");
+	if (cc.mode == CL_SHARD) {
+		/* Peers are reached on the port their A record does not
+		 * carry, so it is this node's own - every pod of one
+		 * Deployment listens on the same one. */
+		cc.port = sc.port;
+		sc.sharded = 1;
+		if (sc.hot_ms)
+			die("-X caches answers for a key this node owns, but "
+			    "-J can move that key to another node at any "
+			    "resolve; the two do not go together");
+	}
 
 	clk_init();
 	if (db_open(&db, &mc) < 0)

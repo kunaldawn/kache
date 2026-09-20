@@ -52,22 +52,58 @@
 
 #include "util/util.h"
 
-#define LB_MAX_BACKENDS 64
+#define LB_MAX_SPECS    64
+/* One name can answer for many pods, so the endpoints are bounded
+ * separately from the names.  The health thread probes each of them in
+ * turn, so this also bounds how long a cycle can take. */
+#define LB_MAX_ENDPOINTS 128
 #define LB_BUF          16384u   /* per direction, per connection */
 #define LB_EVENTS       256
 
 enum { EV_LISTEN = 0, EV_CLIENT, EV_BACKEND, EV_WAKE };
 
-typedef struct Backend {
-	char  addr[300];
+/* What -b named, and what it resolved to.
+ *
+ * These are two things, and conflating them is what made the balancer
+ * unable to stand in front of anything that scales: one -b entry became
+ * one backend at one address, taken from the first record the resolver
+ * happened to return and then fixed for the life of the process.  A name
+ * that answers for four pods was three quarters ignored, and a pod that
+ * replaced another was never noticed.
+ *
+ * So a Spec is the name, and an Endpoint is one address it currently
+ * answers with.  The health thread re-resolves every spec each cycle and
+ * publishes the endpoints that passed their probe; the workers read that
+ * list and nothing else. */
+typedef struct Spec {
+	char  addr[300];      /* "host:port", as given */
 	char  host[256];
 	char  port[16];
+	_Atomic u64 opened, failed;
+} Spec;
+
+typedef struct Endpoint {
 	struct sockaddr_storage sa;
 	socklen_t salen;
 	int   family, socktype, protocol;
-	_Atomic int up;
-	_Atomic u64 opened, failed;
-} Backend;
+	unsigned spec;                     /* which -b entry it came from */
+	char  addr[INET6_ADDRSTRLEN + 8];  /* numeric, for the log */
+} Endpoint;
+
+/* An immutable snapshot of the live endpoints, published by a release
+ * store and read by an acquire load - the same two slot flip the store's
+ * clock and the cluster's membership use, and safe for the same reason:
+ * a worker holds one for the microseconds of an accept while the health
+ * thread replaces it at most once a second.
+ *
+ * Only endpoints that answered their probe are in here, so the accept
+ * path has no health flag to test and no down backend to skip.  It also
+ * means nothing is ever written in place, which is what the old
+ * arrangement did to b->sa while a worker could be reading it. */
+typedef struct View {
+	Endpoint ep[LB_MAX_ENDPOINTS];
+	unsigned n;
+} View;
 
 /* epoll hands back one pointer, and both of a pair's descriptors are in
  * the same epoll, so each side carries its own tag and a way back to the
@@ -113,8 +149,10 @@ typedef struct Worker {
 	_Atomic u64 accepted, closed, refused;
 } Worker;
 
-static Backend backends[LB_MAX_BACKENDS];
-static unsigned nbackends;
+static Spec specs[LB_MAX_SPECS];
+static unsigned nspecs;
+static View views[2];
+static _Atomic unsigned vcur;
 static Worker *workers;
 static unsigned nworkers;
 static _Atomic int stopping;
@@ -141,40 +179,14 @@ now_lb(void)
 
 /* ---- backends -------------------------------------------------------- */
 
-/* A backend's address is kept as a sockaddr rather than looked up per
- * connection, because a connect happens on the accept path and a
- * blocking DNS lookup has no business inside an event loop.  It is
- * re-resolved by the health thread while a backend is down: a container
- * that restarts usually comes back on a different address, and a
- * balancer that resolved once at startup would keep probing an address
- * nothing answers on and never notice the backend return. */
-static int
-resolve(Backend *b)
-{
-	struct addrinfo hints, *res;
-
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_family = AF_UNSPEC;
-	hints.ai_socktype = SOCK_STREAM;
-	if (getaddrinfo(b->host, b->port, &hints, &res) != 0)
-		return -1;
-	memcpy(&b->sa, res->ai_addr, res->ai_addrlen);
-	b->salen = res->ai_addrlen;
-	b->family = res->ai_family;
-	b->socktype = res->ai_socktype;
-	b->protocol = res->ai_protocol;
-	freeaddrinfo(res);
-	return 0;
-}
-
 static int
 add_backend(const char *spec)
 {
-	Backend *b = &backends[nbackends];
+	Spec *b = &specs[nspecs];
 	const char *colon;
 	size_t n;
 
-	if (nbackends >= LB_MAX_BACKENDS)
+	if (nspecs >= LB_MAX_SPECS)
 		return -1;
 	if (strlen(spec) >= sizeof(b->addr))
 		return -1;
@@ -198,65 +210,59 @@ add_backend(const char *spec)
 		return -1;
 	}
 	snprintf(b->port, sizeof(b->port), "%s", colon + 1);
-
-	if (resolve(b) < 0) {
-		warn("%s: cannot resolve", spec);
-		return -1;
-	}
-	atomic_store(&b->up, 1);   /* assumed up until a check says otherwise */
-	nbackends++;
+	nspecs++;
 	return 0;
 }
 
-/* Round robin over the backends that are up.  One relaxed increment on a
- * shared counter, paid once per accepted connection rather than once per
+static inline const View *
+view_now(void)
+{
+	return &views[atomic_load_explicit(&vcur, memory_order_acquire)];
+}
+
+/* Round robin over the live endpoints.  One relaxed increment on a shared
+ * counter, paid once per accepted connection rather than once per
  * request, so the sharing costs nothing measurable and the spread is
  * global rather than per thread - which matters, because SO_REUSEPORT
  * hands connections out by a hash of the four tuple and a small client
  * pool does not arrive evenly. */
-static int
-pick_backend(void)
+static const Endpoint *
+pick_endpoint(const View *v)
 {
-	unsigned i, start;
-
-	if (!nbackends)
-		return -1;
-	start = (unsigned)(atomic_fetch_add_explicit(&rr, 1,
-	                   memory_order_relaxed) % nbackends);
-	for (i = 0; i < nbackends; i++) {
-		unsigned k = (start + i) % nbackends;
-
-		/* Acquire pairs with the release in the health thread, so a
-		 * backend seen as up is seen with the address that was
-		 * resolved for it. */
-		if (atomic_load_explicit(&backends[k].up, memory_order_acquire))
-			return (int)k;
-	}
-	return -1;   /* everything is down; the caller answers accordingly */
+	if (!v->n)
+		return NULL;   /* everything is down; the caller answers so */
+	return &v->ep[(unsigned)(atomic_fetch_add_explicit(&rr, 1,
+	              memory_order_relaxed) % v->n)];
 }
 
 /* ---- health checks ---------------------------------------------------
  *
- * One thread, blocking sockets, one backend at a time.  It runs once a
- * second against a handful of backends, so the simplest possible
+ * One thread, blocking sockets, one endpoint at a time.  It runs once a
+ * second against a handful of endpoints, so the simplest possible
  * implementation is the right one; putting it in the event loops would
- * complicate every loop to save nothing. */
+ * complicate every loop to save nothing.
+ *
+ * It is also where the endpoint list comes from.  Re-resolving every
+ * cycle rather than only while a backend is down is what lets the
+ * balancer stand in front of something that scales: a pod that appears
+ * is in the next view, a pod that goes is out of it, and neither needs
+ * the balancer restarted. */
 static int
-probe(Backend *b)
+probe(const struct sockaddr *sa, socklen_t salen, int family, int socktype,
+      int protocol)
 {
-	static const char req[] = "GET /health HTTP/1.1\r\nHost: lb\r\n"
+	static const char req[] = "GET /ready HTTP/1.1\r\nHost: lb\r\n"
 	                          "Connection: close\r\n\r\n";
 	struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
 	char buf[128];
 	ssize_t got;
 	int fd, ok = 0;
 
-	if ((fd = socket(b->family, b->socktype | SOCK_CLOEXEC,
-	                 b->protocol)) < 0)
+	if ((fd = socket(family, socktype | SOCK_CLOEXEC, protocol)) < 0)
 		return 0;
 	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-	if (connect(fd, (struct sockaddr *)&b->sa, b->salen) == 0 &&
+	if (connect(fd, sa, salen) == 0 &&
 	    write(fd, req, sizeof(req) - 1) == (ssize_t)(sizeof(req) - 1)) {
 		size_t n = 0;
 
@@ -282,39 +288,94 @@ probe(Backend *b)
 	return ok;
 }
 
+/* Resolve every spec, probe everything it names, and keep what answered. */
+static void
+rebuild(View *v)
+{
+	unsigned i, j;
+
+	v->n = 0;
+	for (i = 0; i < nspecs && v->n < LB_MAX_ENDPOINTS; i++) {
+		struct addrinfo hints, *res, *ai;
+		Spec *sp = &specs[i];
+
+		memset(&hints, 0, sizeof hints);
+		hints.ai_family = AF_UNSPEC;
+		hints.ai_socktype = SOCK_STREAM;
+		if (getaddrinfo(sp->host, sp->port, &hints, &res) != 0)
+			continue;   /* keep the others; DNS may be blinking */
+		for (ai = res; ai && v->n < LB_MAX_ENDPOINTS; ai = ai->ai_next) {
+			Endpoint *e = &v->ep[v->n];
+			char host[INET6_ADDRSTRLEN];
+
+			if (getnameinfo(ai->ai_addr, ai->ai_addrlen, host,
+			                sizeof host, NULL, 0,
+			                NI_NUMERICHOST) != 0)
+				continue;
+			/* A resolver can return the same address more than
+			 * once, and two specs can name the same host; either
+			 * way a duplicate would take two turns of the round
+			 * robin for one backend. */
+			for (j = 0; j < v->n; j++)
+				if (!strcmp(v->ep[j].addr, host))
+					break;
+			if (j < v->n)
+				continue;
+			if (!probe(ai->ai_addr, ai->ai_addrlen, ai->ai_family,
+			           ai->ai_socktype, ai->ai_protocol))
+				continue;
+			memcpy(&e->sa, ai->ai_addr, ai->ai_addrlen);
+			e->salen = ai->ai_addrlen;
+			e->family = ai->ai_family;
+			e->socktype = ai->ai_socktype;
+			e->protocol = ai->ai_protocol;
+			e->spec = i;
+			snprintf(e->addr, sizeof e->addr, "%s", host);
+			v->n++;
+		}
+		freeaddrinfo(res);
+	}
+}
+
+static void
+publish(const View *v)
+{
+	unsigned next = atomic_load_explicit(&vcur, memory_order_relaxed) ^ 1u;
+
+	views[next] = *v;
+	atomic_store_explicit(&vcur, next, memory_order_release);
+}
+
 static void *
 health_main(void *arg)
 {
 	struct timespec ts;
+	View *next = emalloc(sizeof *next);
+	unsigned was = 0;
 
 	(void)arg;
 	pthread_setname_np(pthread_self(), "kache-lb/hc");
-	ts.tv_sec = (time_t)(health_ms / 1000);
-	ts.tv_nsec = (long)(health_ms % 1000) * 1000000L;
+	/* Sleep in slices so a shutdown is not held for a whole interval. */
+	ts.tv_sec = 0;
+	ts.tv_nsec = 100 * 1000000L;
 	while (!atomic_load_explicit(&stopping, memory_order_relaxed)) {
-		unsigned i;
+		unsigned slept;
 
-		for (i = 0; i < nbackends; i++) {
-			Backend *b = &backends[i];
-			int was = atomic_load_explicit(&b->up,
-			                               memory_order_relaxed);
-			int now;
-
-			/* Only while it is down, which is also what makes
-			 * rewriting b->sa safe without a lock: a worker only
-			 * reads it after seeing up, and that read is ordered
-			 * against this write by the release store below. */
-			if (!was)
-				resolve(b);
-			now = probe(b);
-			atomic_store_explicit(&b->up, now,
-			                      memory_order_release);
-			if (was != now)
-				info("backend %s is %s", b->addr,
-				     now ? "up" : "down");
+		rebuild(next);
+		if (next->n != was) {
+			info("%u backend%s live", next->n,
+			     next->n == 1 ? "" : "s");
+			was = next->n;
 		}
-		nanosleep(&ts, NULL);
+		publish(next);
+		for (slept = 0; slept < health_ms; slept += 100) {
+			if (atomic_load_explicit(&stopping,
+			                         memory_order_relaxed))
+				break;
+			nanosleep(&ts, NULL);
+		}
 	}
+	free(next);
 	return NULL;
 }
 
@@ -540,8 +601,13 @@ do_accept(Worker *w)
 	int on = 1;
 
 	for (;;) {
+		/* Taken once per accept and held for the whole of it, so the
+		 * address connected to is the one that was picked even if the
+		 * health thread republishes in between. */
+		const View *v = view_now();
+		const Endpoint *e;
 		Conn *c;
-		int fd, bi, bfd;
+		int fd, bfd;
 
 		if ((fd = accept4(w->lfd, NULL, NULL,
 		                  SOCK_NONBLOCK | SOCK_CLOEXEC)) < 0) {
@@ -551,7 +617,7 @@ do_accept(Worker *w)
 		}
 		setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
 
-		if (!w->freelist || (bi = pick_backend()) < 0) {
+		if (!w->freelist || !(e = pick_endpoint(v))) {
 			/* Nothing to hand it to, or nowhere to put it.
 			 * Closing at once is the honest answer: holding it
 			 * open would only make the client wait to find
@@ -563,18 +629,18 @@ do_accept(Worker *w)
 			    memory_order_relaxed);
 			continue;
 		}
-		bfd = socket(backends[bi].family,
-		             backends[bi].socktype | SOCK_NONBLOCK | SOCK_CLOEXEC,
-		             backends[bi].protocol);
+		bfd = socket(e->family,
+		             e->socktype | SOCK_NONBLOCK | SOCK_CLOEXEC,
+		             e->protocol);
 		if (bfd < 0) {
 			close(fd);
 			continue;
 		}
 		setsockopt(bfd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
-		if (connect(bfd, (struct sockaddr *)&backends[bi].sa,
-		            backends[bi].salen) < 0 && errno != EINPROGRESS) {
-			atomic_store_explicit(&backends[bi].failed,
-			    atomic_load_explicit(&backends[bi].failed,
+		if (connect(bfd, (const struct sockaddr *)&e->sa,
+		            e->salen) < 0 && errno != EINPROGRESS) {
+			atomic_store_explicit(&specs[e->spec].failed,
+			    atomic_load_explicit(&specs[e->spec].failed,
 			                         memory_order_relaxed) + 1,
 			    memory_order_relaxed);
 			close(bfd);
@@ -617,8 +683,8 @@ do_accept(Worker *w)
 		atomic_store_explicit(&w->accepted,
 		    atomic_load_explicit(&w->accepted, memory_order_relaxed) + 1,
 		    memory_order_relaxed);
-		atomic_store_explicit(&backends[bi].opened,
-		    atomic_load_explicit(&backends[bi].opened,
+		atomic_store_explicit(&specs[e->spec].opened,
+		    atomic_load_explicit(&specs[e->spec].opened,
 		                         memory_order_relaxed) + 1,
 		    memory_order_relaxed);
 	}
@@ -881,7 +947,7 @@ main(int argc, char *argv[])
 		}
 		free(dup);
 	}
-	if (!nbackends)
+	if (!nspecs)
 		die("-b named no backends");
 
 	signal(SIGPIPE, SIG_IGN);
@@ -910,6 +976,19 @@ main(int argc, char *argv[])
 		pool_init(w, maxconn);
 	}
 
+	/* Resolve and probe once here, before any worker can accept.  The
+	 * health thread would get to it within a cycle, but a connection
+	 * refused in that window would be the balancer's own startup
+	 * showing through rather than anything about the backends. */
+	{
+		View *first = emalloc(sizeof *first);
+
+		rebuild(first);
+		publish(first);
+		if (!first->n)
+			warn("no backend answered /ready yet; still starting");
+		free(first);
+	}
 	if (pthread_create(&hc, NULL, health_main, NULL) != 0)
 		die("cannot start the health checker");
 	for (i = 0; i < nworkers; i++) {
@@ -918,8 +997,12 @@ main(int argc, char *argv[])
 			die("cannot start worker %u", i);
 		started++;
 	}
-	info("kache-lb on %s:%s, %u threads, %u backends", addr, port,
-	     nworkers, nbackends);
+	/* Started before the workers, so the first view is published and
+	 * probed before anything is accepted: a connection refused because
+	 * the health thread had not run yet would be the balancer's own
+	 * startup showing through. */
+	info("kache-lb on %s:%s, %u threads, %u backend name%s", addr, port,
+	     nworkers, nspecs, nspecs == 1 ? "" : "s");
 
 	if (sigwait(&set, &sig) != 0)
 		warn("sigwait:");

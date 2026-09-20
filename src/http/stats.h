@@ -36,7 +36,8 @@ typedef struct Stats {
 	Counter q_pops;
 	Counter hot_hits;      /* answered from the worker's hot set */
 	Counter hot_fills;     /* responses admitted into it */
-	u8      pad[192 - 21 * 8];
+	Counter redirects;     /* 307s to the node that owns the key */
+	u8      pad[192 - 22 * 8];
 } Stats;
 
 _Static_assert(sizeof(Stats) == 192, "stats must stay three cache lines");
@@ -75,6 +76,6 @@ Stats *stats_of(unsigned i);
 /* sum every worker's counters into a plain snapshot */
 void   stats_sum(u64 *out, unsigned n);
 
-#define STATS_FIELDS 21
+#define STATS_FIELDS 22
 
 #endif /* KACHE_STATS_H */

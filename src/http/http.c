@@ -312,6 +312,7 @@ etag_value(Str s, u64 *out)
 	X(431, "Request Header Fields Too Large")                      \
 	X(500, "Internal Server Error")                                \
 	X(501, "Not Implemented")                                      \
+	X(503, "Service Unavailable")                                  \
 	X(505, "HTTP Version Not Supported")                           \
 	X(507, "Insufficient Storage")
 

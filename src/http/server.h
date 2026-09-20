@@ -24,6 +24,10 @@ typedef struct ServerCfg {
 	int         minimal;    /* drop the read side metadata headers */
 	int         affinity;   /* pin worker i to cpu i % ncpu() */
 	u64         hot_ms;     /* hot set freshness window, 0 = off */
+	u64         drain_ms;   /* keep serving but fail /ready for this long
+	                         * after SIGTERM, so a load balancer sheds
+	                         * this node before it stops answering */
+	int         sharded;
 	struct Cluster *cl;     /* NULL when this node stands alone */
 } ServerCfg;
 

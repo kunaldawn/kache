@@ -412,7 +412,15 @@ with a `# TYPE` line each.
 
 ### `GET /health`
 
-`200 ok` as long as the server is accepting requests.
+`200 ok` as long as the process is working.  It stays `200` through a
+shutdown drain, so a liveness check will not restart a node for draining.
+
+### `GET /ready`
+
+`200 ready` normally, `503 draining` once `SIGTERM` has arrived and `-Q`
+is counting down.  This is the one to point a load balancer or a
+Kubernetes readiness probe at: it is what takes a node out of rotation
+before it stops answering, rather than after.
 
 ### `GET /`
 
@@ -492,6 +500,40 @@ written to, and `/mset` and `/mdel` are applied locally without being
 routed to owners, so in a cluster they should be sent to the owner of
 the keys they carry or avoided.
 
+### Sharded clusters (`-J`)
+
+A node started with `-J` instead of `-C` holds only the keys it owns, so
+**reads redirect exactly as writes do** - there is no local copy to
+answer from.  In exchange, capacity is the sum of the nodes rather than
+the size of one, which is what makes the mode fit an autoscaler.  A
+client that follows redirects (`curl -L`) needs no other change.
+
+Membership is whatever the `-J` name resolves to and is re-read every
+`-D` milliseconds, so the owner of a key changes when the cluster is
+resized.  Ownership is rendezvous hashed, so a resize moves about
+`1/(n+1)` of the keyspace and no more; a key that moved is a miss, since
+nothing is migrated behind it.  A client caching "which node owns this"
+should therefore treat a `307` as the correction and not assume the
+mapping is permanent.
+
+Requests naming more than one key are the one place this is visible in
+the API.  A batch whose keys share an owner is redirected whole, like
+any other request; a batch whose keys are spread over several nodes has
+no single right answer and is refused with `409`, because half applying
+it would let a caller read a key that lives elsewhere as a key that does
+not exist.  That applies to `/mget`, `/mset`, `/mdel`, and to `/qmove`
+when `?dst=` is on another node.  Group the keys by owner, or send them
+one at a time and follow the redirects.
+
+`POST /x/repl` answers `404` under `-J`: nothing replicates, so no node
+ever sends one.  `-X` is refused at startup alongside `-J`, because the
+hot set caches an answer for a key that a resolve can move elsewhere.
+
+`/stats` adds `cluster_sharded`, `redirects_total`,
+`discovery_resolves_total` and `discovery_changes_total`.  The last two
+are how often the membership was looked up and how often it had actually
+moved; the gap between them is the cluster sitting still.
+
 
 Status codes
 ------------
@@ -501,17 +543,18 @@ Status codes
 | `200` | value or document returned |
 | `201` | key created |
 | `204` | done, nothing to return |
-| `307` | this node is in a cluster and does not own the key; `Location` names the node that does |
+| `307` | this node is in a cluster and does not own the key; `Location` names the node that does.  Writes only under `-C`; reads as well under `-J` |
 | `400` | malformed request, key or parameter |
 | `403` | `/flush` without `-F` |
 | `404` | no such key or endpoint |
 | `405` | method not allowed on that endpoint |
-| `409` | value is not an integer, the result overflowed, or the key holds another type |
+| `409` | value is not an integer, the result overflowed, the key holds another type, or a multi-key request spans nodes |
 | `412` | a precondition on `If-Match` or `If-None-Match` failed |
 | `413` | key or value over the configured limit |
 | `414` | key longer than the limit |
 | `431` | request headers too large |
 | `501` | chunked transfer encoding |
+| `503` | `/ready` during a shutdown drain; this node wants no new work |
 | `505` | not HTTP/1.0 or HTTP/1.1 |
 | `507` | the shard could not free enough space for the value |
 

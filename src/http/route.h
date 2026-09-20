@@ -18,6 +18,10 @@ typedef struct Ctx {
 	size_t max_req;       /* largest request we will buffer */
 	u64    started;       /* ms since the epoch */
 	int    allow_flush;
+	int    sharded;       /* a key lives on its owner alone, so reads
+	                       * redirect as well as writes */
+	int    draining;      /* SIGTERM seen; /ready answers 503 so the
+	                       * load balancer sheds us before we go */
 	int    minimal;       /* omit the headers a cache client ignores */
 	int    minimal_req;   /* minimal, unless this client needs them all;
 	                       * set by route(), read by the handlers */

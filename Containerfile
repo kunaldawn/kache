@@ -18,5 +18,11 @@ COPY --from=build /src/kache-lb /usr/local/bin/kache-lb
 USER kache
 VOLUME /data
 EXPOSE 7070
+# /ready, not /health: the difference matters during shutdown, when the
+# process is deliberately still alive and answering but wants no new
+# work.  A liveness check on /health would be right here; an orchestrator
+# deciding where to send traffic wants this one.
+HEALTHCHECK --interval=2s --timeout=2s --retries=15 --start-period=2s \
+    CMD wget -qO- http://127.0.0.1:7070/ready || exit 1
 ENTRYPOINT ["/usr/local/bin/kache"]
 CMD ["-f", "/data/kache.db", "-s", "1G", "-p", "7070", "-l", "0.0.0.0"]

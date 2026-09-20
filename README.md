@@ -322,6 +322,111 @@ starts over.  The knobs that matter:
                exactly which, and which are kept regardless
     -A         pin each worker to one cpu
 
+Autoscaling
+-----------
+
+`-C` is a fixed list of nodes, and everything about it assumes that list
+does not change: ownership is `hash % nnodes`, the hash seed is derived
+from the list itself, and each node is told its index with `-N`.  Under a
+HorizontalPodAutoscaler none of those hold.  `-J` is the shape that fits.
+
+    kache -f /data/kache.db -s 768M -n -J kache-peers.default.svc.cluster.local
+
+Members are whatever the name resolves to - a headless Service in
+Kubernetes, a service name under Docker Compose, both of which publish
+one A record per live endpoint.  A node finds itself in that list by
+matching it against its own interfaces (`-I` overrides, and Kubernetes
+can pass `POD_IP` from the downward API), so nothing needs to be told its
+index and nothing is restarted when the membership moves.
+
+A key lives on its owner and nowhere else, which is the difference that
+matters under an autoscaler: capacity is the sum of the pods, so a pod
+added under memory pressure actually relieves it.  Full replication
+cannot do that - there every new pod holds the whole keyspace again.
+Reads redirect exactly as writes do, with `307`.
+
+Ownership is rendezvous hashed per bucket, computed when the membership
+changes and never per request.  What that buys, measured on 1200 keys
+across a real three node rig scaled to four:
+
+    scale 3 -> 4      keys that changed owner
+    rendezvous        23.8%     (theoretical best: 25%)
+    hash % nnodes     74.9%
+
+A moved key is a miss, so that ratio is very nearly the difference in how
+much cache a scale event costs.  The lookup is also cheaper than what it
+replaces - one indexed load against a runtime division, 0.47ns against
+6.01ns - so routing reads as well as writes still comes out ahead.
+
+### Draining, and spot capacity
+
+`-Q ms` is what makes a scale-in or a preemption survivable:
+
+    -Q 5000
+
+On `SIGTERM` the node fails `/ready` but keeps serving for that long.
+The Service drops the endpoint, its peers stop resolving it, and the
+requests already in flight are answered - then it exits.  Without it,
+every in-flight request at `SIGTERM` is a connection reset, which under
+an autoscaler is not a rare event but every scale-in.  Keep it under
+`terminationGracePeriodSeconds`, or `SIGKILL` decides instead.
+
+`/health` and `/ready` are deliberately different.  Liveness stays `200`
+through a drain, so a draining pod is not restarted for draining;
+readiness is the one that sheds traffic.
+
+### Scale on CPU, not memory
+
+A cache fills the arena it was given and then holds it.  Memory
+utilisation therefore rises to a plateau and stays there whatever the
+load is, so an HPA scaling on memory produces a ratchet that only ever
+goes up: adding a pod does not lower the memory of the pods that already
+filled theirs.  Size `-s` against the container limit and scale on CPU,
+which does track load.  `deploy/k8s/kache.yaml` does this.
+
+### What a sharded node cannot do
+
+A batch or a `qmove` naming keys on different nodes has no single right
+answer, and half applying it would let a caller read a key that lives
+elsewhere as a key that does not exist.  So `/mget`, `/mset`, `/mdel` and
+`/qmove` are redirected whole when their keys agree on an owner, and
+refused with `409` when they do not - the same distinction Redis Cluster
+draws between `MOVED` and `CROSSSLOT`.  Group a batch by owner, or ask
+for keys one at a time and follow the redirects.
+
+`-X` is refused with `-J`: the hot set caches an answer for a key this
+node owns, and a resolve can move that key to another node.
+
+Redirects name the addresses the members were discovered at, which inside
+Kubernetes are pod addresses.  A sharded kache is therefore an in-cluster
+service; there is no `-U` for it, because the addresses are not known
+until they are resolved.
+
+### Trying it locally
+
+    docker compose -f deploy/compose.scale.yml up --build -d --scale kache=3
+    docker compose -f deploy/compose.scale.yml exec client sh
+
+`--scale` is the autoscaler.  Test from the `client` container rather
+than the host: a redirect names a container address, which is routable on
+that network and not from outside it, for exactly the reason above.
+
+    docker compose -f deploy/compose.scale.yml up -d --scale kache=5
+    docker kill --signal=KILL deploy-kache-2     # a spot reclamation
+
+`deploy/k8s/kache.yaml` is the same topology as a Deployment, two
+Services, an HPA and a PodDisruptionBudget.  Two things to set before
+applying it: the image path, and `-D` against your cluster's DNS caching
+- NodeLocal DNSCache is on by default on GKE and its TTL stacks on top of
+`-D`, so convergence is the sum of the two.
+
+`kache-lb` works in front of either mode: one `-b` name expands to every
+address it resolves to and is re-resolved each health cycle, so replicas
+added and removed are picked up without restarting it.  It probes
+`/ready`, so a draining node leaves the rotation before it stops
+answering.  In Kubernetes a Service already does this, and the balancer
+is for the deployments that have no Service to lean on.
+
 Security
 --------
 

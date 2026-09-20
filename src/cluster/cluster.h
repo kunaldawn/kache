@@ -31,7 +31,37 @@
  *
  * The cost is staleness: a write is visible on other nodes after one
  * flush interval plus a round trip.  Reads are always local and never
- * wait for a peer. */
+ * wait for a peer.
+ *
+ * ---- two modes -------------------------------------------------------
+ *
+ * The above is CL_REPLICA, reached with -C: a fixed list of nodes, every
+ * one holding everything.  It is the right shape when the working set
+ * fits on one node and what is wanted is more read throughput.
+ *
+ * CL_SHARD, reached with -J, is the other shape, and it is the one that
+ * belongs under a horizontal autoscaler.  A key lives on its owner and
+ * nowhere else, so capacity is the sum of the pods rather than the size
+ * of one, and a pod added under memory pressure actually relieves it -
+ * which full replication cannot do, because there every new pod holds
+ * the whole keyspace again.  Reads redirect like writes, there is no
+ * replication stream, and the flusher does not run.
+ *
+ * Membership is then not a list anyone configures.  Pods under an
+ * autoscaler have no stable index and no stable address, so the members
+ * are whatever a DNS name resolves to right now - a headless Service in
+ * Kubernetes, a service name under Docker Compose, both of which return
+ * one A record per live endpoint.  A node finds itself in that list by
+ * matching it against its own interfaces, so nothing has to be told
+ * which node it is.
+ *
+ * Ownership therefore has to survive the list changing under it, which
+ * rules out the index arithmetic -C can afford: with `hash % nnodes` a
+ * 7 to 8 scale event moves 87% of the keyspace, and every moved key is a
+ * miss plus a redirect.  Rendezvous hashing over node identity moves the
+ * 1/(n+1) that has to move and not one key more.  It is evaluated per
+ * bucket when the membership changes, never per request - see the owner
+ * table below. */
 #ifndef KACHE_CLUSTER_H
 #define KACHE_CLUSTER_H
 
@@ -40,9 +70,26 @@
 
 #define CL_MAX_NODES 64
 
+enum {
+	CL_REPLICA = 0,   /* -C: fixed members, every node holds everything */
+	CL_SHARD   = 1    /* -J: discovered members, a key lives on one */
+};
+
 typedef struct Cluster Cluster;
 
 typedef struct ClusterCfg {
+	int         mode;      /* CL_REPLICA or CL_SHARD */
+	/* CL_SHARD: the name whose A records are the members, and the port
+	 * they all listen on.  Every pod is given the same one, which is
+	 * also what lets them agree on a hash seed without being told. */
+	const char *discover;
+	const char *port;
+	/* This node's own address, when interface matching is not the right
+	 * answer.  In Kubernetes that is the downward API's POD_IP; it is
+	 * also the escape hatch for a CNI that does not put the pod address
+	 * on an interface inside the pod. */
+	const char *self_addr;
+	u64         resolve_ms;   /* how often to re-resolve; 0 uses the default */
 	const char *peers;     /* "host:port,host:port,..." in node order */
 	/* What a client should be told to use, when that is not the
 	 * address the nodes use between themselves.  Behind NAT, in
@@ -60,22 +107,26 @@ typedef struct ClusterCfg {
 int  cl_open(Cluster **out, Db *db, const ClusterCfg *cfg);
 void cl_close(Cluster *c);
 
-/* The node that owns this key's writes.  Every node computes the same
- * answer from the hash alone, so ownership needs no agreement and no
- * lookup - it is the top bits of the hash over the node count. */
-unsigned cl_owner(const Cluster *c, u64 hash);
-int      cl_is_mine(const Cluster *c, u64 hash);
-/* "host:port" of a node as the cluster reaches it */
-const char *cl_addr(const Cluster *c, unsigned node);
-/* the same node as a client should reach it: the advertised address when
- * one was given, otherwise the peer address.  This is what goes in the
- * Location of a redirect. */
-const char *cl_client_addr(const Cluster *c, unsigned node);
-unsigned    cl_self(const Cluster *c);
-unsigned    cl_nodes(const Cluster *c);
+/* Where a key belongs.  0 when this node owns it and the caller should
+ * just answer; 1 when it does not, with addr filled in with the owner's
+ * client facing "host:port" for the Location of a 307.
+ *
+ * One call rather than an owner index and a second lookup, because under
+ * -J the membership can change between two calls and an index resolved
+ * against a newer list names a different node.  Everything here is read
+ * from one snapshot, so the answer is at worst a moment stale - never
+ * self contradictory. */
+int cl_route(Cluster *c, u64 hash, char *addr, size_t cap);
+
+unsigned cl_self(const Cluster *c);
+unsigned cl_nodes(const Cluster *c);
+/* members seen by the last resolve, and how many resolves have happened;
+ * both are 0 under -C, where membership never moves */
+void cl_discovery(const Cluster *c, u64 *resolves, u64 *changes);
 
 /* Note that this node changed a key, so the flusher ships it.  Cheap and
- * coalescing: the key is recorded, the value is read when it is sent. */
+ * coalescing: the key is recorded, the value is read when it is sent.
+ * Does nothing under -J, where there is nothing to ship a copy to. */
 void cl_dirty(Cluster *c, const void *k, u32 kl);
 
 /* Apply a batch that arrived from the owner.  Never marks anything
